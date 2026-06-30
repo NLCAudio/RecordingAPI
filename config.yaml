@@ -1,0 +1,6 @@
+apiVersion: 0.0.1
+framework: avfoundation
+inputDevice: "MacBook Air Microphone" # "Dante Virtual Soundcard"
+bitrate: 128k
+outputPath: ./
+companionBaseUrl: http://127.0.0.1:8001/
