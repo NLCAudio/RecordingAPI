@@ -123,13 +123,18 @@ def get_device_number(config: dict) -> int:
     audio_devices = subprocess.run(
         list_audio_devices_cmd, capture_output=True, text=True
     )
+
     audio_device_idx_mapping = {}
     for audio_device in re.findall(
-        rf"\[{config['framework']} indev @ \w*\] \[\d+\] [\w\s]+\n",
-        re.search(r"audio devices:[\w\W]+ Error", audio_devices.stderr).group(0),
+        rf"\[{config['framework'].lower()} indev @ \w*\] \[\d+\] [\w\s]+\n",
+        re.search(r"audio devices:[\w\W]+ Error", audio_devices.stderr)
+        .group(0)
+        .lower(),
     ):
         audio_device = re.sub(
-            rf"\[{config['framework']} indev @ \w+]", "", audio_device.strip().lower()
+            rf"\[{config['framework'].lower()} indev @ \w+]",
+            "",
+            audio_device.strip().lower(),
         ).strip()
         audio_device_idx = re.match(r"\[\d+\]", audio_device).group(0)
         audio_device = audio_device.replace(audio_device_idx, "").strip().lower()
