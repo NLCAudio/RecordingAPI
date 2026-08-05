@@ -3,7 +3,7 @@ apiVersion: 0.0.1
 # override. inputDevice is matched against the device names ffmpeg reports, so
 # on Windows it matches every "DVS Receive N-M (Dante Virtual Soundcard)" pair.
 framework: auto
-inputDevice: "MacBook Air Microphone"
+inputDevice: "Dante Virtual Soundcard"
 bitrate: 128k
 # Windows only: how many milliseconds dshow buffers before handing audio to
 # ffmpeg. Leave unset for the device default; raise it if recordings drop audio.
