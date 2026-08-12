@@ -31,12 +31,35 @@ def push_status(registry: SessionRegistry, config: Config) -> None:
     # time, which matters at 15 pushes a second.
     push_session = requests.Session()
 
+    # Companion can be down for a whole service. At 15 pushes a second that is
+    # tens of thousands of identical lines, which would rotate everything else
+    # out of the log — so only the transitions are logged, not every failure.
+    failing = False
+
     while True:
         try:
             status = json.dumps(registry.status())
-            push_session.post(url, params={"value": status})
-        except requests.RequestException:
+            response = push_session.post(url, params={"value": status})
+            # Reaching Companion is not the same as it accepting the push: a
+            # renamed custom variable answers 404 and the panel silently stops
+            # updating, which is exactly the kind of thing this log is for.
+            response.raise_for_status()
+            if failing:
+                logger.info("companion push recovered at %s", url)
+                failing = False
+        except requests.RequestException as e:
             # Companion being down must not kill the loop; it will be back.
-            pass
+            if not failing:
+                logger.warning(
+                    "companion push failing at %s: %s (further failures not logged "
+                    "until it recovers)",
+                    url,
+                    e,
+                )
+                failing = True
+        except Exception:
+            # A bug in here would otherwise kill the thread without a word, and
+            # the meter would just stop moving with the server still up.
+            logger.exception("companion push loop error")
 
         time.sleep(interval)

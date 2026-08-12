@@ -367,6 +367,17 @@ def relay_ffmpeg_output(
             # astats numbers channels from 1; levels is indexed from 0.
             channel = int(match.group(1)) - 1
             registry.set_level(room_name, session, channel, parse_db(match.group(2)))
+    except Exception:
+        # Nothing else can report this: an exception raised in a thread is
+        # printed to stderr, which is thrown away under pythonw.exe.
+        logger.exception("[%s] level reader failed", room_name)
     finally:
-        logger.info("[%s] ffmpeg exited with code %s", room_name, process.poll())
+        # wait() rather than poll(): stderr reaching EOF only means ffmpeg
+        # closed the pipe, and poll() returns None until the process is
+        # actually reaped, which is why exits used to be logged as "code None".
+        code = process.wait()
+        # A non-zero exit means ffmpeg gave up — the file is likely truncated
+        # or missing, so it belongs at a level the log can be filtered for.
+        log = logger.info if code == 0 else logger.error
+        log("[%s] ffmpeg exited with code %s", room_name, code)
         registry.silence_levels(room_name, session)

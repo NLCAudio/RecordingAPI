@@ -61,6 +61,11 @@ LOG_CONFIG = {
         "uvicorn": {"handlers": ["file"], "level": "INFO", "propagate": False},
         "uvicorn.access": {"handlers": ["file"], "level": "INFO", "propagate": False},
     },
+    # Catches anything logged by a library we didn't name — without it those
+    # lines hit logging's "no handler" fallback and are written to a stderr
+    # that pythonw.exe discards. main.py opts recording_api out of this, so
+    # recording lines aren't written to both files.
+    "root": {"handlers": ["file"], "level": "WARNING"},
 }
 
 
