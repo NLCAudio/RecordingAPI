@@ -8,6 +8,11 @@ bitrate: 128k
 # Windows only: how many milliseconds dshow buffers before handing audio to
 # ffmpeg. Leave unset for the device default; raise it if recordings drop audio.
 # audioBufferMs: 200
+# Recordings are filed as <outputPath>/<room>/<service>/<file>.mp3; the folders
+# are created on demand.
 outputPath: ./recordings
 logPath: ./recording_api.log
-companionBaseUrl: http://127.0.0.1:8001/
+# Every Companion instance the status is pushed to, one per line. Each gets its
+# own push thread, so one machine being switched off does not slow the others.
+companionBaseUrls:
+  - http://127.0.0.1:8001/

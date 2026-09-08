@@ -30,10 +30,17 @@ Edit `config.yaml` before starting the server:
 framework: avfoundation          # audio capture framework — see note below
 inputDevice: "MacBook Air Microphone"  # exact name of the audio device to record from
 bitrate: 128k                    # MP3 quality (128k is CD-quality stereo)
-outputPath: ./                   # folder where MP3 files are saved
-companionBaseUrl: http://127.0.0.1:8001/  # address of your Bitfocus Companion instance
+outputPath: ./recordings         # folder where recordings are filed
+companionBaseUrls:               # every Bitfocus Companion instance to push status to
+  - http://127.0.0.1:8001/
+  - http://192.168.1.50:8001/
 statusPushRefreshHz: 15          # how often per second to push status to Companion
 ```
+
+`companionBaseUrls` takes a list even when there is only one address. Each
+address is pushed to from its own thread, so a Companion machine that is
+switched off or unreachable does not hold up the others — the failure is logged
+once and again when it recovers.
 
 **`framework` by OS:**
 
@@ -86,7 +93,19 @@ All endpoints accept a JSON body. Every field has a default, so you only need to
 | `POST` | `/recording/toggle` | Start if stopped, stop if running |
 | `GET` | `/status` | Return status of all active recordings |
 
-Output files are named `{room_name}_{service_name}_{timestamp}.mp3` and saved to `outputPath`.
+Recordings are filed under a folder per room, and a folder per service inside it. Any folder that does not exist yet is created when the recording starts:
+
+```
+recordings/                      # outputPath
+  LR FOH/                        # room_name
+    Sunday Service/              # service_name
+      LR FOH_Sunday Service_2026-09-08_09-30-00.mp3
+      LR FOH_Sunday Service_2026-09-08_11-00-00.mp3
+    Prayer/
+      LR FOH_Prayer_2026-09-08_08-25-00.mp3
+```
+
+The room and service stay in the filename as well, so a file still says what it is once it is copied out of its folder. Characters that cannot appear in a folder name (`/`, `\`, `:`, `<`, `>`, `"`, `|`, `?`, `*`) are replaced with `_` and the substitution is logged; the recording still goes ahead.
 
 ### Status response example
 
@@ -99,7 +118,7 @@ Output files are named `{room_name}_{service_name}_{timestamp}.mp3` and saved to
       "recording": true,
       "elapsed_s": 142,
       "elapsed_str": "00:02:22",
-      "path": "./sanctuary_9am_2026-06-29_09:00:00.mp3",
+      "path": "recordings/sanctuary/9am/sanctuary_9am_2026-06-29_09-00-00.mp3",
       "audio_input_level_left": -18.4,
       "audio_input_level_right": -19.1
     }
@@ -111,4 +130,4 @@ Output files are named `{room_name}_{service_name}_{timestamp}.mp3` and saved to
 
 ## Bitfocus Companion Integration
 
-The server continuously pushes its status JSON to Companion's custom variable `recording_status` at the rate set by `statusPushRefreshHz`. You can read this variable in Companion to show recording state, elapsed time, or audio levels on your button panel.
+The server continuously pushes its status JSON to the custom variable `recording_status` on every Companion instance in `companionBaseUrls`, at the rate set by `statusPushRefreshHz`. You can read this variable in Companion to show recording state, elapsed time, or audio levels on your button panel.

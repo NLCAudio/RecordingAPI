@@ -51,6 +51,36 @@ NO_WINDOW_FLAG = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # How long to wait for ffmpeg to finalise the file before force-killing it.
 STOP_TIMEOUT_S = 10
 
+# Lines ffmpeg prints only once every input and output is open and the encode
+# has begun. It prints neither if it gives up on the device, the encoder options
+# or the output file — verified against ffmpeg 8.1 for each of those failures —
+# which is what makes them proof that a recording really started rather than a
+# guess based on elapsed time. A per-second level line means the same thing and
+# more (audio has reached the encoder), so it counts too, in relay_ffmpeg_output.
+# Two spellings because one wording change in a future ffmpeg must not leave
+# every start unconfirmed.
+STARTED_MARKER = re.compile(rb"Press \[q\] to stop|Output #\d+,")
+
+# The backstop for an ffmpeg that neither confirms nor exits — a device that
+# hangs on open, say. Only reached when something is already wrong; a healthy
+# start confirms in well under half a second.
+STARTUP_TIMEOUT_S = 5.0
+
+# Characters that cannot appear in a folder or file name on Windows. The set
+# also covers both path separators, which is what keeps a room name like
+# "../../etc" from writing outside outputPath.
+INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+# Names Windows refuses whatever the extension, left over from DOS devices.
+RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
 logger = logging.getLogger("recording_api")
 
 
@@ -81,6 +111,15 @@ class Session:
     levels: list[float] = dataclasses.field(
         default_factory=lambda: [FLOOR_LEVEL_DB, FLOOR_LEVEL_DB]
     )
+    # How the start turned out. All four are written by the one stderr reader
+    # thread and read by confirm_started() once the event says they are final,
+    # so they need no lock of their own.
+    startup_settled: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    confirmed_recording: bool = False  # ffmpeg said it is encoding
+    exit_code: int | None = None  # set instead, if it exited first
+    last_message: str = ""  # its last stderr line, which says why
 
     @property
     def is_running(self) -> bool:
@@ -159,16 +198,22 @@ class SessionRegistry:
             # touches the filesystem, which is far too slow to hold up readers.
             session = start_ffmpeg(request, config)
 
-            with self._state_lock:
-                self._sessions[room_name] = session
-
             # Watches ffmpeg's stderr for level data and keeps the Session
-            # updated in real time.
+            # updated in real time. Started before the room is registered
+            # because it is also what reports whether the start worked at all.
             threading.Thread(
                 target=relay_ffmpeg_output,
                 args=(self, room_name, session),
                 daemon=True,
             ).start()
+
+            # Raises if ffmpeg failed, leaving the room unregistered and idle —
+            # so a failed start is reported as one instead of leaving a session
+            # behind that never records anything.
+            confirm_started(room_name, session)
+
+            with self._state_lock:
+                self._sessions[room_name] = session
 
             logger.info("[%s] recording started -> %s", room_name, session.path)
             return session
@@ -267,6 +312,110 @@ def free_path(path: Path) -> Path:
     return candidate
 
 
+def safe_name(raw: str, fallback: str) -> str:
+    """`raw` reduced to something every filesystem accepts as one folder name.
+
+    Room and service names arrive in the request body, so they are whatever the
+    Companion button was configured with — and they are about to become folder
+    names. Anything unusable is replaced rather than rejected: an odd-looking
+    folder is a much better outcome mid-service than a button press that
+    records nothing.
+    """
+    name = INVALID_NAME_CHARS.sub("_", raw)
+    # Windows silently drops trailing dots and spaces, so a service named "9am."
+    # would not end up in the folder we think we created. Stripping leading ones
+    # too also disposes of "." and "..", which contain no invalid character but
+    # would otherwise walk up out of outputPath.
+    name = name.strip(" .")
+    if not name:
+        return fallback
+    if name.upper() in RESERVED_NAMES:
+        # Prefixed rather than replaced, so a room genuinely called "AUX" is
+        # still recognisable in the folder listing.
+        return f"_{name}"
+    return name
+
+
+def prepare_output_path(config: Config, request: RecordingRequest) -> str:
+    """Create <outputPath>/<room>/<service>/ and return the file to record into.
+
+    Grouping recordings by room and then by service is what keeps a season of
+    services findable; the room, service and timestamp stay in the filename as
+    well, so a file that is copied out of here still says what it is.
+    """
+    room = safe_name(request.room_name, fallback="room")
+    service = safe_name(request.service_name, fallback="service")
+    for raw, safe, field in (
+        (request.room_name, room, "room_name"),
+        (request.service_name, service, "service_name"),
+    ):
+        if safe != raw:
+            logger.warning(
+                "[%s] %s %r cannot be a folder name; recording into %r instead",
+                request.room_name,
+                field,
+                raw,
+                safe,
+            )
+
+    directory = config.output_path / room / service
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        # Re-raised with the full path: the operator needs to know which folder
+        # could not be made, and "Permission denied" alone does not say.
+        raise OSError(f"could not create recording folder {directory}: {e}") from e
+
+    # mkdir succeeding on a folder that already exists says nothing about being
+    # able to write into it — a read-only OneDrive folder gets caught here
+    # rather than as an ffmpeg error a second later.
+    if not os.access(directory, os.W_OK):
+        raise OSError(f"recording folder {directory} is not writable")
+
+    return str(
+        free_path(
+            directory / f"{room}_{service}_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp3"
+        )
+    )
+
+
+def confirm_started(room_name: str, session: Session) -> None:
+    """Wait until ffmpeg is known to be recording, or known to have failed.
+
+    Popen returns as soon as the process is *spawned*, so an ffmpeg that refuses
+    the device or cannot open the output file still looks like a successful
+    start: the button lights up green and the service goes unrecorded. So rather
+    than assume, wait for ffmpeg to say which of the two happened — the stderr
+    reader is already watching for exactly that and sets the event either way.
+
+    A healthy start settles this in around a third of a second, and a failing
+    one usually faster, so the wait costs nothing that is not worth knowing.
+    """
+    if not session.startup_settled.wait(STARTUP_TIMEOUT_S):
+        # Neither confirmed nor exited. Reporting a failure here would be its
+        # own kind of lie — ffmpeg may well be recording — so let it run and
+        # leave a line explaining why the button took so long to answer.
+        logger.warning(
+            "[%s] ffmpeg has not confirmed it is recording after %.0fs; treating "
+            "it as running -> %s",
+            room_name,
+            STARTUP_TIMEOUT_S,
+            session.path,
+        )
+        return
+
+    if session.confirmed_recording:
+        return
+
+    # The event was set by the reader thread reaching end of output, which it
+    # only does once ffmpeg has exited and been reaped — so exit_code and
+    # last_message are both final by now.
+    raise OSError(
+        f"ffmpeg exited with code {session.exit_code} without recording "
+        f"{session.path}: {session.last_message or 'no output from ffmpeg'}"
+    )
+
+
 def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
     # Ask the platform's backend which ffmpeg inputs carry the requested
     # channels. Resolved per recording because devices come and go (Dante
@@ -275,16 +424,7 @@ def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
         request.left_input_channel, request.right_input_channel
     )
 
-    # A filename with the room, service and timestamp in it, so recordings are
-    # easy to identify after the fact.
-    os.makedirs(config.output_path, exist_ok=True)
-    out_path = str(
-        free_path(
-            config.output_path
-            / f"{request.room_name}_{request.service_name}"
-            f"_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp3"
-        )
-    )
+    out_path = prepare_output_path(config, request)
 
     # stdin=PIPE lets us send "q" to stop ffmpeg gracefully later.
     # stderr=PIPE lets relay_ffmpeg_output consume the level output.
@@ -353,15 +493,25 @@ def relay_ffmpeg_output(
                 break
 
             match = LEVEL_LINE.search(line)
+
+            # A level line means audio has already reached the encoder, and the
+            # markers mean ffmpeg opened everything and began; either settles
+            # the question confirm_started() is waiting on.
+            if not session.startup_settled.is_set() and (
+                match is not None or STARTED_MARKER.search(line)
+            ):
+                session.confirmed_recording = True
+                session.startup_settled.set()
+
             if match is None:
                 # The "ametadata" check skips the frame/pts header lines that
                 # accompany every per-second level print.
                 if b"ametadata" not in line:
-                    logger.info(
-                        "[%s] ffmpeg: %s",
-                        room_name,
-                        line.decode(errors="replace").rstrip(),
-                    )
+                    message = line.decode(errors="replace").rstrip()
+                    # Kept so a start that fails can report the reason, which
+                    # ffmpeg puts in the last thing it says before exiting.
+                    session.last_message = message
+                    logger.info("[%s] ffmpeg: %s", room_name, message)
                 continue
 
             # astats numbers channels from 1; levels is indexed from 0.
@@ -376,6 +526,11 @@ def relay_ffmpeg_output(
         # closed the pipe, and poll() returns None until the process is
         # actually reaped, which is why exits used to be logged as "code None".
         code = process.wait()
+        session.exit_code = code
+        # Set last, so that a start still waiting on this reads an exit code and
+        # a reason that are already final. Does nothing if the recording ran
+        # normally and confirmed itself long ago.
+        session.startup_settled.set()
         # A non-zero exit means ffmpeg gave up — the file is likely truncated
         # or missing, so it belongs at a level the log can be filtered for.
         log = logger.info if code == 0 else logger.error

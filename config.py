@@ -14,7 +14,7 @@ aliases below map between the two.
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 DEFAULT_LOG_PATH = Path(__file__).parent / "recording_api.log"
@@ -39,20 +39,58 @@ class Config(BaseModel):
     # Windows only: how many milliseconds dshow buffers before handing audio to
     # ffmpeg. None leaves it at the device default.
     audio_buffer_ms: int | None = Field(None, alias="audioBufferMs")
-    # Where finished recordings are written. Created on demand.
+    # Where finished recordings are written, under a folder per room and a
+    # folder per service inside it. All of it created on demand.
     output_path: Path = Field(alias="outputPath")
     log_path: Path = Field(DEFAULT_LOG_PATH, alias="logPath")
-    companion_base_url: str = Field(alias="companionBaseUrl")
+    # Every Companion instance the status is pushed to. A list, because a site
+    # can have more than one control surface and each needs its own copy.
+    companion_base_urls: list[str] = Field(alias="companionBaseUrls")
     # How many times per second the status push runs. 15 Hz is an update every
-    # ~67 ms, fast enough for a live meter.
-    status_push_refresh_hz: float = Field(15, alias="statusPushRefreshHz")
+    # ~67 ms, fast enough for a live meter. Must be above zero — the push
+    # interval is derived from it.
+    status_push_refresh_hz: float = Field(15, alias="statusPushRefreshHz", gt=0)
 
-    @field_validator("companion_base_url")
+    @model_validator(mode="before")
     @classmethod
-    def strip_trailing_slash(cls, url: str) -> str:
-        # So the URLs built from this never end up with a doubled slash,
-        # whether or not the config file happens to include one.
-        return url.rstrip("/")
+    def reject_renamed_url_key(cls, data: object) -> object:
+        # companionBaseUrls used to be companionBaseUrl and hold a single
+        # address, so a config.yaml written before that change — or copied over
+        # from the other machine — arrives here. extra="forbid" would reject it
+        # anyway, but only as "extra inputs are not permitted", which doesn't
+        # say what to write instead. This is the one error that stops the server
+        # from starting at all, so it is worth spelling out.
+        if isinstance(data, dict) and "companionBaseUrl" in data:
+            raise ValueError(
+                "companionBaseUrl has been replaced by companionBaseUrls, which "
+                "takes a list so the status can go to more than one Companion. "
+                f"Write it as:\ncompanionBaseUrls:\n  - {data['companionBaseUrl']}"
+            )
+        return data
+
+    @field_validator("companion_base_urls", mode="before")
+    @classmethod
+    def reject_single_url(cls, urls: object) -> object:
+        # A list of one is still a list; a bare address is a common thing to
+        # write and pydantic would only answer "input should be a valid list".
+        if isinstance(urls, str):
+            raise ValueError(
+                "expected a list of addresses, not a single one. Write it as:\n"
+                f"companionBaseUrls:\n  - {urls}"
+            )
+        return urls
+
+    @field_validator("companion_base_urls")
+    @classmethod
+    def clean_urls(cls, urls: list[str]) -> list[str]:
+        # Trailing slashes are stripped so the URLs built from these never end
+        # up doubled, whether or not the config file happens to include one.
+        cleaned = [url.strip().rstrip("/") for url in urls if url.strip()]
+        if not cleaned:
+            raise ValueError("expected at least one address")
+        # Two identical entries would mean two threads pushing the same value to
+        # the same panel, at twice the rate and to no effect.
+        return list(dict.fromkeys(cleaned))
 
 
 def load_config() -> Config:

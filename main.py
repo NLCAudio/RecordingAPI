@@ -12,12 +12,13 @@ makes. There are three main actions:
   POST /recording/toggle — start if stopped, stop if running
 
 The server uses ffmpeg (a free command-line audio/video tool) to do the
-actual recording and encodes the result as an MP3 file. While recording it
-also reads the live audio level (in dB) so dashboards can display a meter.
+actual recording and encodes the result as an MP3 file. Recordings are filed
+under a folder per room, and a folder per service inside that. While recording
+it also reads the live audio level (in dB) so dashboards can display a meter.
 
-A background task runs continuously in a separate thread and pushes the
-current status to a Bitfocus Companion "custom variable" so the button panel
-always shows what is happening without needing to poll.
+A background task per configured address runs continuously in its own thread
+and pushes the current status to a Bitfocus Companion "custom variable" so the
+button panels always show what is happening without needing to poll.
 
 Configuration (audio device, output folder, companion URL, etc.) lives in
 config.yaml next to this file, so you don't need to touch the code to
@@ -34,7 +35,6 @@ This file holds only the HTTP layer. The work behind it lives in:
 # TODO: write to a local folder, then push to one drive
 
 import logging
-import threading
 from contextlib import asynccontextmanager, contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -49,7 +49,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
 from backends import ChannelNotAvailableError, DeviceNotFoundError
-from companion import push_status
+from companion import start_status_push
 from config import DEFAULT_LOG_PATH, load_config
 from recording import RecordingRequest, SessionRegistry
 
@@ -95,14 +95,12 @@ async def lifespan(app: FastAPI):
         raise
 
     setup_logging(config.log_path)
-    # When the server starts up, launch the status-push loop in the background.
-    # daemon=True means this thread is automatically killed when the main
-    # program exits, so we don't need to clean it up manually.
-    threading.Thread(
-        target=push_status, args=(registry, config), daemon=True
-    ).start()
+    # When the server starts up, launch one status-push loop per configured
+    # Companion address in the background.
+    start_status_push(registry, config)
     logger.info(
-        "Audio level push started to companion at %s", config.companion_base_url
+        "Audio level push started to companion at %s",
+        ", ".join(config.companion_base_urls),
     )
     yield
 
