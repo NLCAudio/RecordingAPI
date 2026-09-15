@@ -20,6 +20,19 @@ Install Python dependencies:
 pip install -e .
 ```
 
+### Development
+
+The test suite is fully offline — no ffmpeg, audio hardware or Companion
+needed. It exercises the config parsing, the capture backends against
+captured ffmpeg device listings, the session registry state machine, the
+process lifecycle, the level-meter relay, the Companion push loop and the
+HTTP endpoints against fakes.
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
 ---
 
 ## Configuration
@@ -48,7 +61,11 @@ once and again when it recovers.
 |----|-------|
 | macOS | `avfoundation` |
 | Windows | `dshow` |
-| Linux | `alsa` or `pulse` |
+
+`avfoundation` and `dshow` are the two built-in backends. Linux is not
+supported yet — with `framework: auto` the server refuses to start there with
+a message listing the available frameworks, rather than guessing at a device
+naming scheme that differs between FFmpeg builds.
 
 To list available device names on your system, run:
 ```bash
@@ -143,10 +160,12 @@ All endpoints accept a JSON body. Every field has a default, so you only need to
 {
   "room_name": "sanctuary",
   "service_name": "9am",
-  "left_input_channel": 0,
-  "right_input_channel": 1
+  "left_input_channel": 1,
+  "right_input_channel": 2
 }
 ```
+
+Channels are numbered the way Dante Controller numbers them, from 1.
 
 | Method | Path | Description |
 |--------|------|-------------|
