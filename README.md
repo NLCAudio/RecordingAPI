@@ -73,6 +73,68 @@ The server listens on `http://localhost:8000` by default.
 
 ---
 
+## Running unattended on Windows
+
+For a machine that should record whenever it is powered on, with nobody there to start anything. Three pieces have to line up: the BIOS powers the machine back on, Windows reaches a desktop by itself, and the server starts in that desktop session.
+
+### 1. BIOS — power on after a power loss
+
+On an HP EliteDesk, press `F10` during boot, then find **After Power Loss** (under *Advanced → Built-In Device Options*, or *Power Management Options* depending on the model) and set it to **Power On**. The default is *Power Off*, which leaves the machine dark after an outage.
+
+### 2. Windows — log on by itself
+
+The server has to run **inside a logged-on desktop session**, not as a background service. Two reasons, both of which bite silently rather than loudly:
+
+- **Audio capture.** A task set to run "at startup" runs in session 0, which has no desktop. DirectShow capture from Dante Virtual Soundcard is not reliable there.
+- **OneDrive.** OneDrive is per-user and does not run in session 0 at all, so recordings written to a OneDrive folder would sit there unsynced.
+
+So set the machine to log on automatically. Use [Sysinternals Autologon](https://learn.microsoft.com/sysinternals/downloads/autologon) rather than `netplwiz` — it stores the password as an encrypted LSA secret instead of in plain text in the registry:
+
+```
+Autologon.exe <username> <domain-or-machine-name> <password>
+```
+
+Be deliberate about this: the machine is then unlocked at the console after every boot, so it relies on the rack or room being physically secure. Set the power plan to never sleep while you are there (`Control Panel → Power Options → High performance`), and make sure Dante Virtual Soundcard is set to start automatically too.
+
+### 3. The server — start it at log on
+
+From the project folder, in PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\install-task.ps1
+```
+
+That registers a Task Scheduler entry called `RecordingAPI` which runs `run_server.py` with `pythonw.exe` (no console window) 30 seconds after log on, restarts it up to three times if it fails, and — importantly — has **no execution time limit**. Task Scheduler's default is to stop a task after three days, which would take the server down mid-week.
+
+Start it once without rebooting, then confirm:
+
+```powershell
+Start-ScheduledTask -TaskName RecordingAPI
+curl http://127.0.0.1:8000/status
+```
+
+If nothing answers, `server.log` in the project folder has the reason — `run_server.py` sends uvicorn's own output there precisely because `pythonw.exe` has no console to print it to.
+
+**Test the whole chain before you rely on it.** Cut power at the wall, restore it, and check that `/status` answers without anyone touching the machine.
+
+### Restarting after a code change
+
+```
+windows\restart.cmd
+```
+
+Double-click it, or run it from a prompt. It stops any recording **through the API** so each MP3 is finalised with an accurate duration header, kills the server as a process tree, starts it again, and waits until it answers — so a syntax error in what you just changed is reported rather than leaving you with a server that quietly never came up.
+
+If a room is recording it asks before stopping it. Pass `-Force` to skip the prompt.
+
+```
+windows\restart.cmd -Force
+```
+
+Killing the server as a *tree* is the part that matters: ffmpeg runs as a child process, and an orphaned ffmpeg keeps the Dante device open, so the next recording fails to start. Stopping the server from Task Manager instead will leave one behind.
+
+---
+
 ## API Endpoints
 
 All endpoints accept a JSON body. Every field has a default, so you only need to include what differs.
