@@ -93,8 +93,28 @@ class Config(BaseModel):
         return list(dict.fromkeys(cleaned))
 
 
-def load_config() -> Config:
-    # Called per request rather than cached, so edits to config.yaml take
-    # effect without restarting the server.
-    with open(CONFIG_PATH, "r") as file:
-        return Config(**yaml.safe_load(file))
+def load_config(path: Path | None = None) -> Config:
+    """Read and validate config.yaml (or the given file, in tests).
+
+    Called per request rather than cached, so edits to config.yaml take
+    effect without restarting the server.
+
+    Relative outputPath/logPath values are resolved against the directory
+    the config file lives in, not the process's current directory. fastapi
+    can be started from anywhere (the Windows Task Scheduler launches the
+    server from System32), and a recording quietly written to the wrong
+    folder is far worse than one that fails loudly.
+    """
+    path = Path(path) if path is not None else CONFIG_PATH
+    with open(path, "r") as file:
+        config = Config(**yaml.safe_load(file))
+
+    base = path.resolve().parent
+    updates: dict = {}
+    if not config.output_path.is_absolute():
+        updates["output_path"] = base / config.output_path
+    # A log_path that defaults to DEFAULT_LOG_PATH is already absolute and
+    # points next to the code; only an explicit relative one needs anchoring.
+    if config.log_path != DEFAULT_LOG_PATH and not config.log_path.is_absolute():
+        updates["log_path"] = base / config.log_path
+    return config.model_copy(update=updates) if updates else config

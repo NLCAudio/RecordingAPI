@@ -25,7 +25,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backends import CaptureInput, get_backend
 from config import Config
@@ -100,12 +100,14 @@ def format_time(seconds: int) -> str:
 
 # What one recording needs to know about itself. This doubles as the JSON body
 # callers send to the start/stop/toggle endpoints, which FastAPI validates for
-# us. Channels are numbered the way Dante Controller numbers them, from 1.
+# us. Channels are numbered the way Dante Controller numbers them, from 1 —
+# a 0 or negative channel is always a caller mistake, and rejecting it here
+# gives a clear 422 instead of an ffmpeg failure a moment later.
 class RecordingRequest(BaseModel):
     room_name: str = "room_name"
     service_name: str = "service_name"
-    left_input_channel: int = 1  # which input channel maps to the left side
-    right_input_channel: int = 2  # which input channel maps to the right side
+    left_input_channel: int = Field(1, ge=1)  # which input channel maps to the left side
+    right_input_channel: int = Field(2, ge=1)  # which input channel maps to the right side
 
 
 @dataclasses.dataclass

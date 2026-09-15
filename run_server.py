@@ -9,10 +9,11 @@ Running `uvicorn main:app` from a terminal is fine for testing, but a
 background launcher has two problems this file solves:
 
   1. It starts in whatever folder the launcher happens to use — for Windows
-     Task Scheduler that is C:\\Windows\\System32. The relative paths in
-     config.yaml (outputPath, logPath) are resolved against the working
-     directory, so without the chdir below the recordings would be written
-     somewhere nobody would think to look.
+     Task Scheduler that is C:\\Windows\\System32. Relative paths in
+     config.yaml are resolved against the config file's own folder (see
+     load_config in config.py), so the chdir below makes the working
+     directory agree with that folder — and anything else that keys off the
+     working directory behaves as if started from the project.
 
   2. Launched with pythonw.exe there is no console, so anything uvicorn
      prints is thrown away — including the reason it failed to start. The
