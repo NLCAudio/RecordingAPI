@@ -30,6 +30,16 @@ from pydantic import BaseModel
 from backends import CaptureInput, get_backend
 from config import Config
 
+# How often the file being recorded is forced out of the OS page cache and onto
+# the disk. -flush_packets (see build_recording_cmd) hands every MP3 frame to
+# the OS the moment it is encoded, but the OS is then free to hold it in memory
+# until its own writeback timer fires — 30s on macOS — and a power cut takes
+# whatever is still sitting there. fsync closes that window. Five seconds is
+# short enough to bound the loss to something nobody will miss and long enough
+# that the syncing itself is nothing: the data is already in the cache, so each
+# call measured well under a millisecond, including on a OneDrive folder.
+DISK_SYNC_INTERVAL_S = 5.0
+
 # Audio levels below this dB value are treated as silence / no signal.
 FLOOR_LEVEL_DB = -60.0
 
@@ -120,6 +130,11 @@ class Session:
     confirmed_recording: bool = False  # ffmpeg said it is encoding
     exit_code: int | None = None  # set instead, if it exited first
     last_message: str = ""  # its last stderr line, which says why
+    # Tells sync_to_disk() to do its last fsync and let go of the file. Set once
+    # ffmpeg has exited, however it exited.
+    ffmpeg_finished: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
 
     @property
     def is_running(self) -> bool:
@@ -212,6 +227,15 @@ class SessionRegistry:
             # behind that never records anything.
             confirm_started(room_name, session)
 
+            # Only now, because this opens the recording by name and ffmpeg has
+            # just told us it has created it. Starting it alongside the reader
+            # above would race ffmpeg to the file.
+            threading.Thread(
+                target=sync_to_disk,
+                args=(room_name, session),
+                daemon=True,
+            ).start()
+
             with self._state_lock:
                 self._sessions[room_name] = session
 
@@ -292,6 +316,16 @@ def build_recording_cmd(
         "libmp3lame",  # encode as MP3
         "-b:a",
         config.bitrate,
+        # Write each MP3 frame to the file as it is encoded, instead of letting
+        # ffmpeg fill its 256KB output buffer first. Without this a recording
+        # killed by a power cut loses everything still in that buffer, which at
+        # 128k is up to sixteen seconds — and, because the buffer only starts
+        # filling once the file is opened, a recording shorter than the first
+        # 256KB leaves a file of zero bytes. Measured, not assumed: ten seconds
+        # then SIGKILL gives an empty file without the flag and a complete one
+        # with it. The cost is one small write per frame, about 38 a second.
+        "-flush_packets",
+        "1",
         output_path,
     ]
 
@@ -468,6 +502,58 @@ def stop_ffmpeg(process: subprocess.Popen) -> None:
         process.wait()
 
 
+def sync_to_disk(room_name: str, session: Session) -> None:
+    """Force the recording onto the disk every few seconds until ffmpeg is done.
+
+    Runs in its own thread for each active recording. ffmpeg has no option for
+    this — it writes and lets the OS decide when those bytes reach the disk —
+    so the flush has to come from outside the process.
+
+    The file is opened read-only on purpose. fsync flushes a file's dirty pages
+    whichever way the handle was opened, and a read-only one cannot truncate,
+    move or otherwise disturb the file ffmpeg is in the middle of writing.
+    """
+    try:
+        fd = os.open(session.path, os.O_RDONLY)
+    except OSError as e:
+        # Not worth failing the recording over: ffmpeg is already recording, and
+        # -flush_packets has the data as far as the OS either way. Only the last
+        # few seconds of an unexpected power cut are at stake.
+        logger.warning(
+            "[%s] cannot open %s to flush it to disk; recording continues "
+            "unsynced: %s",
+            room_name,
+            session.path,
+            e,
+        )
+        return
+
+    try:
+        while True:
+            finished = session.ffmpeg_finished.wait(DISK_SYNC_INTERVAL_S)
+            try:
+                os.fsync(fd)
+            except OSError as e:
+                # Windows cannot flush through a read-only handle, so rather
+                # than log this once a tick for the length of a service, say it
+                # plainly and leave the rest to -flush_packets.
+                logger.warning(
+                    "[%s] cannot flush %s to disk; recording continues "
+                    "unsynced: %s",
+                    room_name,
+                    session.path,
+                    e,
+                )
+                return
+            # Checked after the fsync, not instead of it: the event is set once
+            # ffmpeg has exited and been reaped, so this last pass is what gets
+            # the end of a finished recording onto the disk.
+            if finished:
+                return
+    finally:
+        os.close(fd)
+
+
 def parse_db(raw_db: bytes) -> float:
     # ffmpeg reports "inf" or "nan" for silence and invalid input; clamp those
     # to the floor so consumers always get a sensible number.
@@ -527,6 +613,9 @@ def relay_ffmpeg_output(
         # actually reaped, which is why exits used to be logged as "code None".
         code = process.wait()
         session.exit_code = code
+        # ffmpeg has written the last of the file and gone, so release the disk
+        # syncer to make its final pass over it.
+        session.ffmpeg_finished.set()
         # Set last, so that a start still waiting on this reads an exit code and
         # a reason that are already final. Does nothing if the recording ran
         # normally and confirmed itself long ago.

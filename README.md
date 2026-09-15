@@ -107,6 +107,14 @@ recordings/                      # outputPath
 
 The room and service stay in the filename as well, so a file still says what it is once it is copied out of its folder. Characters that cannot appear in a folder name (`/`, `\`, `:`, `<`, `>`, `"`, `|`, `?`, `*`) are replaced with `_` and the substitution is logged; the recording still goes ahead.
 
+### Surviving a power cut
+
+A recording that is interrupted — the machine loses power, the process is killed — is left as a playable MP3 of everything captured up to roughly the last five seconds. Nothing has to be repaired afterwards and the file opens in any player, because MP3 has no index or trailer that a clean stop is required to write.
+
+Two things make that hold. ffmpeg is told to write each MP3 frame to the file as it is encoded rather than buffering 256KB of them first, and the file is flushed from the operating system's cache onto the disk every five seconds. Without the first, an interrupted recording loses up to sixteen seconds at 128k — and one cut short before it reaches that first full buffer is left as an empty file.
+
+A recording stopped the normal way, through `/recording/stop` or `/recording/toggle`, is unaffected: ffmpeg still finalises it with an accurate duration header.
+
 ### Status response example
 
 ```json
