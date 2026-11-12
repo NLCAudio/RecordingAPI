@@ -11,6 +11,12 @@ bitrate: 128k
 # Recordings are filed as <outputPath>/<room>/<service>/<file>.mp3; the folders
 # are created on demand.
 outputPath: ./recordings
+# Where the server listens. 127.0.0.1 only accepts requests from this machine;
+# set listenHost to 0.0.0.0 to accept them from other machines as well (on
+# Windows that also needs an inbound firewall rule for the port). Changing
+# either needs a restart of the server.
+listenHost: 127.0.0.1
+listenPort: 8000
 # Set this when two servers report to the same Companion (e.g. "mac" on one and
 # "windows" on the other). The status is then pushed to the custom variable
 # recording_status_<serverName> instead of recording_status, so the two do not

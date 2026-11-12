@@ -110,7 +110,7 @@ if [ ! -f "$LAUNCHER" ]; then
 fi
 if [ ! -x "$PYTHON" ]; then
     echo "error: no virtual environment at $PROJECT_DIR/.venv" >&2
-    echo "Create it first:  python3 -m venv .venv && .venv/bin/pip install -e ." >&2
+    echo "Create it first:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
     exit 1
 fi
 if ! FFMPEG="$(command -v ffmpeg)"; then

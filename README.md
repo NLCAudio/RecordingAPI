@@ -17,7 +17,7 @@ Under the hood it drives [ffmpeg](https://ffmpeg.org/) to capture audio from any
 Install Python dependencies:
 
 ```bash
-pip install -e .
+pip install -r requirements.txt
 ```
 
 ---
@@ -36,6 +36,8 @@ companionBaseUrls:               # every Bitfocus Companion instance to push sta
   - http://192.168.1.50:8001/
 statusPushRefreshHz: 15          # how often per second to push status to Companion
 serverName: mac                  # optional — only when two servers share one Companion
+listenHost: 127.0.0.1            # 0.0.0.0 to accept requests from other machines
+listenPort: 8000
 ```
 
 `companionBaseUrls` takes a list even when there is only one address. Each
@@ -70,7 +72,7 @@ fastapi dev main.py
 fastapi run main.py
 ```
 
-The server listens on `http://localhost:8000` by default.
+The server listens on `http://localhost:8000` by default. `listenHost` and `listenPort` in `config.yaml` apply when it is started through `run_server.py`, which is what the Windows task and the macOS agent do; `fastapi dev` and `fastapi run` take `--host` and `--port` instead.
 
 ---
 
@@ -192,7 +194,7 @@ Two machines — a Mac and a Windows PC, say — can record the same rooms and r
 
 2. **Point both at Companion.** `companionBaseUrls` on each server needs the address of the machine Companion runs on; `127.0.0.1` only works on that machine itself.
 
-3. **Let Companion reach both.** `run_server.py` listens on `127.0.0.1` by default, which only accepts requests from the same machine. On any server Companion reaches over the network, set `HOST = "0.0.0.0"` there, and on Windows add an inbound firewall rule for port 8000.
+3. **Let Companion reach both.** The server listens on `127.0.0.1` by default, which only accepts requests from the same machine. On any server Companion reaches over the network, set `listenHost: 0.0.0.0` in `config.yaml` and restart it, and on Windows add an inbound firewall rule for port 8000.
 
 For a recording, redundancy is strongest when **each button press starts both servers** — two HTTP actions on the one button — rather than switching to the second server after the first has failed. A fail-over only helps the next recording; the one that was running is cut off at the moment of the failure. Both machines need the same Dante channels routed to them for this.
 

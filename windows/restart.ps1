@@ -17,7 +17,8 @@
     exists, the server is started directly instead.
 
 .PARAMETER BaseUrl
-    Where the server listens. Must match HOST and PORT in run_server.py.
+    Where to reach the server from this machine. Must use the listenPort set
+    in config.yaml.
 
 .PARAMETER Force
     Restart without asking, even if rooms are recording. For unattended use.

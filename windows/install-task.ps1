@@ -55,7 +55,7 @@ if (Test-Path -LiteralPath $venvPythonw) {
 else {
     $found = Get-Command pythonw.exe -ErrorAction SilentlyContinue
     if (-not $found) {
-        throw "pythonw.exe not found. Create the virtual environment first (py -m venv .venv, then .\.venv\Scripts\pip install -e .) or add Python to PATH."
+        throw "pythonw.exe not found. Create the virtual environment first (py -m venv .venv, then .\.venv\Scripts\pip install -r requirements.txt) or add Python to PATH."
     }
     $Pythonw = $found.Source
     Write-Warning "No .venv found; using $Pythonw. The task will fail unless this Python has the project's dependencies."

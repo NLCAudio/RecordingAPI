@@ -46,6 +46,13 @@ class Config(BaseModel):
     # Every Companion instance the status is pushed to. A list, because a site
     # can have more than one control surface and each needs its own copy.
     companion_base_urls: list[str] = Field(alias="companionBaseUrls")
+    # The address and port run_server.py listens on. 127.0.0.1 only accepts
+    # requests from this machine, which is all that is needed while Companion
+    # runs alongside it. "0.0.0.0" accepts them from other machines too — that
+    # also needs an inbound rule for the port in Windows Defender Firewall.
+    # Read once at start-up, so changing either needs a restart of the server.
+    listen_host: str = Field("127.0.0.1", alias="listenHost")
+    listen_port: int = Field(8000, alias="listenPort", ge=1, le=65535)
     # What this server calls itself when more than one reports to the same
     # Companion — a Mac and a Windows machine recording the same rooms, say. It
     # becomes part of the custom variable name, recording_status_<serverName>,

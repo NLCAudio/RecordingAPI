@@ -28,12 +28,7 @@ from pathlib import Path
 
 import uvicorn
 
-# 127.0.0.1 means only this machine can reach the API, which is all that is
-# needed while Companion runs alongside it. Change to "0.0.0.0" to accept
-# requests from a Companion on another machine — that also needs an inbound
-# rule for this port in Windows Defender Firewall.
-HOST = "127.0.0.1"
-PORT = 8000
+from config import Config, load_config
 
 PROJECT_DIR = Path(__file__).parent
 SERVER_LOG = PROJECT_DIR / "server.log"
@@ -69,6 +64,21 @@ LOG_CONFIG = {
 }
 
 
+def listen_address() -> tuple[str, int]:
+    """Where to listen: listenHost and listenPort from config.yaml."""
+    try:
+        config = load_config()
+    except Exception:
+        # A broken config.yaml stops the server either way. Carrying on with
+        # the defaults lets uvicorn get as far as main.py's start-up, which
+        # writes the actual reason to the log before giving up — failing here
+        # instead would say nothing at all under pythonw.exe.
+        fields = Config.model_fields
+        return fields["listen_host"].default, fields["listen_port"].default
+    return config.listen_host, config.listen_port
+
+
 if __name__ == "__main__":
     os.chdir(PROJECT_DIR)
-    uvicorn.run("main:app", host=HOST, port=PORT, log_config=LOG_CONFIG)
+    host, port = listen_address()
+    uvicorn.run("main:app", host=host, port=port, log_config=LOG_CONFIG)
