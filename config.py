@@ -46,6 +46,15 @@ class Config(BaseModel):
     # Every Companion instance the status is pushed to. A list, because a site
     # can have more than one control surface and each needs its own copy.
     companion_base_urls: list[str] = Field(alias="companionBaseUrls")
+    # What this server calls itself when more than one reports to the same
+    # Companion — a Mac and a Windows machine recording the same rooms, say. It
+    # becomes part of the custom variable name, recording_status_<serverName>,
+    # so each server has a variable of its own instead of both overwriting one.
+    # Left unset the variable stays plain recording_status, as it was before
+    # there were two. Restricted to what a Companion variable name may contain.
+    server_name: str | None = Field(
+        None, alias="serverName", pattern=r"^[A-Za-z0-9_]+$"
+    )
     # How many times per second the status push runs. 15 Hz is an update every
     # ~67 ms, fast enough for a live meter. Must be above zero — the push
     # interval is derived from it.

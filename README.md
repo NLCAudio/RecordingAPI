@@ -35,6 +35,7 @@ companionBaseUrls:               # every Bitfocus Companion instance to push sta
   - http://127.0.0.1:8001/
   - http://192.168.1.50:8001/
 statusPushRefreshHz: 15          # how often per second to push status to Companion
+serverName: mac                  # optional — only when two servers share one Companion
 ```
 
 `companionBaseUrls` takes a list even when there is only one address. Each
@@ -135,6 +136,68 @@ Killing the server as a *tree* is the part that matters: ffmpeg runs as a child 
 
 ---
 
+## Running unattended on macOS
+
+The same three pieces as on Windows: the Mac powers itself back on, logs in by itself, and the server starts in that session.
+
+### 1. Power — come back on, and never sleep
+
+```bash
+sudo pmset -a autorestart 1        # power on again when power returns
+sudo pmset -a sleep 0 disksleep 0  # never sleep; a sleeping Mac stops recording
+```
+
+`autorestart` is the same setting as *System Settings → Energy → Start up automatically after a power failure*. Also turn off automatic installation of macOS updates (*General → Software Update → Automatic Updates*), or the Mac will pick its own moment to restart.
+
+### 2. macOS — log in by itself
+
+*System Settings → Users & Groups → Automatically log in as*. The option is unavailable while **FileVault** is on, so FileVault has to be off on this Mac. As on Windows, the machine is then unlocked after every boot and relies on being physically secure.
+
+The server has to run inside that logged-in session rather than as a system daemon: microphone permission is granted per user and only honoured in that user's session, and OneDrive only runs there.
+
+### 3. The server — start it at log in
+
+```bash
+macos/install-agent.sh
+```
+
+That writes a launchd agent to `~/Library/LaunchAgents/local.recording-api.plist` and loads it. The server starts at every log in and is started again if it ever exits. The agent is given a `PATH` that includes the folder ffmpeg is installed in, because launchd's default `PATH` leaves Homebrew out and every recording would otherwise fail with ffmpeg not found.
+
+**Start one test recording while sitting at the Mac.** The first time, macOS asks whether to allow microphone access (and possibly access to the folder the project is in). Those questions appear on screen and have to be answered once; until they are, recordings fail.
+
+`macos/install-agent.sh --remove` takes the agent out again, and `--print` shows the plist without installing it. If the server does not come up, look at `server.log` and `launchd.log` in the project folder.
+
+### Restarting after a code change
+
+```bash
+macos/restart.sh           # asks first if a room is recording
+macos/restart.sh --force   # restarts without asking
+```
+
+Like the Windows one, it stops recordings through the API so each MP3 is finalised, restarts the server, and waits until it answers.
+
+---
+
+## Running two servers for redundancy
+
+Two machines — a Mac and a Windows PC, say — can record the same rooms and report to the same Companion. Three settings make that work:
+
+1. **Give each server a name** in its `config.yaml`:
+
+   ```yaml
+   serverName: mac        # "windows" on the other machine
+   ```
+
+   Each server then pushes to its own custom variable, `recording_status_mac` and `recording_status_windows`, instead of both overwriting `recording_status`. Create both variables in Companion first — a push to a variable that does not exist is answered with a 404 and logged.
+
+2. **Point both at Companion.** `companionBaseUrls` on each server needs the address of the machine Companion runs on; `127.0.0.1` only works on that machine itself.
+
+3. **Let Companion reach both.** `run_server.py` listens on `127.0.0.1` by default, which only accepts requests from the same machine. On any server Companion reaches over the network, set `HOST = "0.0.0.0"` there, and on Windows add an inbound firewall rule for port 8000.
+
+For a recording, redundancy is strongest when **each button press starts both servers** — two HTTP actions on the one button — rather than switching to the second server after the first has failed. A fail-over only helps the next recording; the one that was running is cut off at the moment of the failure. Both machines need the same Dante channels routed to them for this.
+
+---
+
 ## API Endpoints
 
 All endpoints accept a JSON body. Every field has a default, so you only need to include what differs.
@@ -200,4 +263,40 @@ A recording stopped the normal way, through `/recording/stop` or `/recording/tog
 
 ## Bitfocus Companion Integration
 
-The server continuously pushes its status JSON to the custom variable `recording_status` on every Companion instance in `companionBaseUrls`, at the rate set by `statusPushRefreshHz`. You can read this variable in Companion to show recording state, elapsed time, or audio levels on your button panel.
+The server continuously pushes its status JSON to the custom variable `recording_status` on every Companion instance in `companionBaseUrls`, at the rate set by `statusPushRefreshHz`. You can read this variable in Companion to show recording state, elapsed time, or audio levels on your button panel. With `serverName` set, the variable is `recording_status_<serverName>` instead.
+
+What is pushed is the `/status` response plus three fields:
+
+```json
+{
+  "status": "online",
+  "sessions": { },
+  "server": "mac",
+  "recording_count": 0,
+  "pushed_at": 1794519087
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `server` | This server's `serverName`, or `null` if none is set |
+| `recording_count` | How many rooms are recording right now |
+| `pushed_at` | When this value was pushed, in seconds since the Unix epoch |
+
+### Showing whether a server is reachable
+
+A custom variable keeps its last value forever, so a server that has lost power still reads `"status": "online"`. What tells a live server from a dead one is the age of `pushed_at`: a running server refreshes it many times a second, so a value more than a few seconds old means the server has stopped pushing.
+
+A button text expression along these lines shows one server's state:
+
+```
+$(internal:time_unix) - jsonparse($(custom:recording_status_mac))['pushed_at'] > 5
+  ? 'MAC\nDOWN'
+  : jsonparse($(custom:recording_status_mac))['recording_count'] > 0
+    ? 'MAC\nREC'
+    : 'MAC\nREADY'
+```
+
+Give each variable the default value `{"pushed_at":0,"recording_count":0}` when creating it, so the expression has something to parse — and reads as DOWN — before the server's first push arrives.
+
+The same conditions work as *feedback* expressions to colour the button, and a second copy with `recording_status_windows` covers the other server. The comparison uses the clocks of two different machines, so both the server and the Companion machine need to keep their time synchronised (the default on macOS and Windows).

@@ -11,6 +11,11 @@ bitrate: 128k
 # Recordings are filed as <outputPath>/<room>/<service>/<file>.mp3; the folders
 # are created on demand.
 outputPath: ./recordings
+# Set this when two servers report to the same Companion (e.g. "mac" on one and
+# "windows" on the other). The status is then pushed to the custom variable
+# recording_status_<serverName> instead of recording_status, so the two do not
+# overwrite each other. Letters, digits and underscores only.
+# serverName: mac
 logPath: ./recording_api.log
 # Every Companion instance the status is pushed to, one per line. Each gets its
 # own push thread, so one machine being switched off does not slow the others.

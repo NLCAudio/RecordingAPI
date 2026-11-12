@@ -49,7 +49,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
 from backends import ChannelNotAvailableError, DeviceNotFoundError
-from companion import start_status_push
+from companion import start_status_push, variable_name
 from config import DEFAULT_LOG_PATH, load_config
 from recording import RecordingRequest, SessionRegistry
 
@@ -99,8 +99,9 @@ async def lifespan(app: FastAPI):
     # Companion address in the background.
     start_status_push(registry, config)
     logger.info(
-        "Audio level push started to companion at %s",
+        "Audio level push started to companion at %s as custom variable %s",
         ", ".join(config.companion_base_urls),
+        variable_name(config.server_name),
     )
     yield
 
