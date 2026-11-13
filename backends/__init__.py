@@ -12,6 +12,7 @@ import sys
 
 from config import Config
 
+from .audioqueue import AudioQueueBackend
 from .avfoundation import AVFoundationBackend
 from .base import (
     CaptureBackend,
@@ -22,12 +23,15 @@ from .base import (
 from .dshow import DShowBackend
 
 BACKENDS = {
+    AudioQueueBackend.framework: AudioQueueBackend,
     AVFoundationBackend.framework: AVFoundationBackend,
     DShowBackend.framework: DShowBackend,
 }
 
 FRAMEWORK_BY_PLATFORM = {
-    "darwin": AVFoundationBackend.framework,
+    # Not avfoundation: ffmpeg loses audio capturing through it. It is still
+    # there to be asked for by name, for comparison.
+    "darwin": AudioQueueBackend.framework,
     "win32": DShowBackend.framework,
 }
 

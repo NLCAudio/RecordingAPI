@@ -1,12 +1,13 @@
 apiVersion: 0.0.1
-# auto picks avfoundation on macOS and dshow on Windows; set it explicitly to
+# auto picks audioqueue on macOS and dshow on Windows; set it explicitly to
 # override. inputDevice is matched against the device names ffmpeg reports, so
 # on Windows it matches every "DVS Receive N-M (Dante Virtual Soundcard)" pair.
 framework: auto
 inputDevice: "Dante Virtual Soundcard"
 bitrate: 128k
-# Windows only: how many milliseconds dshow buffers before handing audio to
-# ffmpeg. Leave unset for the device default; raise it if recordings drop audio.
+# How many milliseconds of audio the capture may hold before any is lost. Leave
+# unset for the default (the device's own on Windows, 2000 on macOS); raise it
+# if the log reports lost audio.
 # audioBufferMs: 200
 # Recordings are filed as <outputPath>/<room>/<service>/<file>.mp3; the folders
 # are created on demand.

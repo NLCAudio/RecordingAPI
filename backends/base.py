@@ -21,6 +21,7 @@ import dataclasses
 import re
 import subprocess
 from abc import ABC, abstractmethod
+from typing import BinaryIO, Protocol
 
 from config import Config
 
@@ -44,6 +45,21 @@ class CaptureInput:
     # to it and maps the result into the output file. A backend that needs
     # more than one input (Windows) also combines them here.
     filter_prefix: str
+    # Set when the audio does not come from an ffmpeg input device but is
+    # written into ffmpeg's stdin by the server (macOS). The recording then
+    # starts by calling feeder.start(<ffmpeg's stdin>) and ends by calling
+    # feeder.stop(), which closes that pipe — instead of sending ffmpeg "q".
+    feeder: "AudioFeeder | None" = None
+
+
+class AudioFeeder(Protocol):
+    """Something that writes one recording's audio into ffmpeg's stdin."""
+
+    def start(self, sink: BinaryIO) -> None:
+        """Begin writing into sink. Raises OSError if the device won't open."""
+
+    def stop(self) -> None:
+        """Write what is left and close the sink. Safe to call twice."""
 
 
 def pan_to_stereo(left_index: int, right_index: int) -> str:

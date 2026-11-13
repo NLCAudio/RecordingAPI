@@ -28,6 +28,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from backends import CaptureInput, get_backend
+from backends.base import AudioFeeder
 from config import Config
 
 # How often the file being recorded is forced out of the OS page cache and onto
@@ -135,6 +136,9 @@ class Session:
     ffmpeg_finished: threading.Event = dataclasses.field(
         default_factory=threading.Event
     )
+    # What writes the audio into ffmpeg's stdin, on a backend where ffmpeg does
+    # not read the device itself (macOS). None where it does.
+    feeder: AudioFeeder | None = None
 
     @property
     def is_running(self) -> bool:
@@ -251,7 +255,7 @@ class SessionRegistry:
                 # ffmpeg died on its own; _live_session has just dropped it.
                 return None
 
-            stop_ffmpeg(session.process)
+            stop_ffmpeg(session)
 
             with self._state_lock:
                 self._sessions.pop(room_name, None)
@@ -460,7 +464,8 @@ def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
 
     out_path = prepare_output_path(config, request)
 
-    # stdin=PIPE lets us send "q" to stop ffmpeg gracefully later.
+    # stdin=PIPE lets us send "q" to stop ffmpeg gracefully later — or, with a
+    # feeder, is where the audio itself goes in.
     # stderr=PIPE lets relay_ffmpeg_output consume the level output.
     process = subprocess.Popen(
         build_recording_cmd(config, capture_input, out_path),
@@ -471,15 +476,44 @@ def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
         creationflags=NO_WINDOW_FLAG,
     )
 
+    if capture_input.feeder is not None:
+        try:
+            capture_input.feeder.start(process.stdin)
+        except OSError:
+            # The device would not open. ffmpeg is already running and would
+            # wait for audio forever, so take it down before reporting why.
+            process.kill()
+            process.wait()
+            raise
+
     return Session(
         service_name=request.service_name,
         process=process,
         started_at=time.time(),
         path=out_path,
+        feeder=capture_input.feeder,
     )
 
 
-def stop_ffmpeg(process: subprocess.Popen) -> None:
+def stop_ffmpeg(session: Session) -> None:
+    process = session.process
+
+    if session.feeder is not None:
+        # stdin carries the audio here, so there is no "q" to send. Ending the
+        # capture closes the pipe instead, and ffmpeg finalises the MP3 when
+        # its input ends, just as it does for "q".
+        session.feeder.stop()
+    else:
+        send_quit(process)
+
+    try:
+        process.wait(timeout=STOP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def send_quit(process: subprocess.Popen) -> None:
     # Ask ffmpeg to stop by sending the "q" key over its stdin, which lets it
     # finalise the MP3 properly (write headers, flush buffers).
     try:
@@ -494,12 +528,6 @@ def stop_ffmpeg(process: subprocess.Popen) -> None:
             process.terminate()
         else:
             process.send_signal(signal.SIGINT)
-
-    try:
-        process.wait(timeout=STOP_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
 
 
 def sync_to_disk(room_name: str, session: Session) -> None:
@@ -616,6 +644,10 @@ def relay_ffmpeg_output(
         # ffmpeg has written the last of the file and gone, so release the disk
         # syncer to make its final pass over it.
         session.ffmpeg_finished.set()
+        # If ffmpeg ended by itself there is nobody left to record for; let go
+        # of the device. Does nothing after a normal stop, which already has.
+        if session.feeder is not None:
+            session.feeder.stop()
         # Set last, so that a start still waiting on this reads an exit code and
         # a reason that are already final. Does nothing if the recording ran
         # normally and confirmed itself long ago.

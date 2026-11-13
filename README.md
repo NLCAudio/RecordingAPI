@@ -27,7 +27,7 @@ pip install -r requirements.txt
 Edit `config.yaml` before starting the server:
 
 ```yaml
-framework: avfoundation          # audio capture framework — see note below
+framework: auto                  # how the device is read — see note below
 inputDevice: "MacBook Air Microphone"  # exact name of the audio device to record from
 bitrate: 128k                    # MP3 quality (128k is CD-quality stereo)
 outputPath: ./recordings         # folder where recordings are filed
@@ -45,18 +45,25 @@ address is pushed to from its own thread, so a Companion machine that is
 switched off or unreachable does not hold up the others — the failure is logged
 once and again when it recovers.
 
-**`framework` by OS:**
+**`framework`** is best left at `auto`, which picks the right one per OS:
 
 | OS | Value |
 |----|-------|
-| macOS | `avfoundation` |
+| macOS | `audioqueue` |
 | Windows | `dshow` |
 | Linux | `alsa` or `pulse` |
 
+On macOS the server reads the device itself, through Apple's Audio Queue Services, and passes the audio to ffmpeg for encoding. ffmpeg's own macOS capture (`avfoundation`) can still be selected by name, but it loses audio — about a tenth of it in a test on a MacBook's microphone — and has no setting to prevent that.
+
+`audioBufferMs` sets how much audio the capture may hold before any is lost. On macOS the default is 2000; if the log ever reports `lost … ms of audio`, raise it.
+
 To list available device names on your system, run:
 ```bash
-ffmpeg -f <framework> -list_devices true -i ""
+ffmpeg -f dshow -list_devices true -i ""          # Windows
+ffmpeg -f avfoundation -list_devices true -i ""   # macOS
 ```
+
+A recording started with a device name that does not exist is refused, and the error lists the devices that were found.
 
 ---
 

@@ -28,16 +28,19 @@ class Config(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     api_version: str = Field("0.0.1", alias="apiVersion")
-    # Which ffmpeg capture framework to use: "auto" picks avfoundation on macOS
-    # and dshow on Windows. See backends/__init__.py.
+    # How the audio device is read: "auto" picks audioqueue on macOS and dshow
+    # on Windows. "avfoundation" is ffmpeg's own macOS capture, kept only for
+    # comparison because it loses audio. See backends/__init__.py.
     framework: str = "auto"
     # Matched against the device names ffmpeg reports, so on Windows this one
     # name matches every "DVS Receive N-M (Dante Virtual Soundcard)" pair.
     input_device: str = Field(alias="inputDevice")
     # MP3 quality / file size trade-off, e.g. "128k".
     bitrate: str = "128k"
-    # Windows only: how many milliseconds dshow buffers before handing audio to
-    # ffmpeg. None leaves it at the device default.
+    # How many milliseconds of audio the capture may hold before any is lost,
+    # which is what rides out a moment where the machine is busy. On Windows it
+    # is dshow's buffer, and None leaves it at the device default. On macOS it
+    # is the length of the capture queue, and None means two seconds.
     audio_buffer_ms: int | None = Field(None, alias="audioBufferMs")
     # Where finished recordings are written, under a folder per room and a
     # folder per service inside it. All of it created on demand.
@@ -66,6 +69,17 @@ class Config(BaseModel):
     # ~67 ms, fast enough for a live meter. Must be above zero — the push
     # interval is derived from it.
     status_push_refresh_hz: float = Field(15, alias="statusPushRefreshHz", gt=0)
+
+    @property
+    def local_url(self) -> str:
+        """The address this machine itself reaches the server on.
+
+        Used by the restart and install scripts, so they follow listenHost and
+        listenPort instead of carrying an address of their own. Not simply
+        listenHost: "0.0.0.0" means "every address" when listening and is not
+        somewhere to connect to, so that becomes the loopback address.
+        """
+        return local_url(self.listen_host, self.listen_port)
 
     @model_validator(mode="before")
     @classmethod
@@ -107,6 +121,17 @@ class Config(BaseModel):
         # Two identical entries would mean two threads pushing the same value to
         # the same panel, at twice the rate and to no effect.
         return list(dict.fromkeys(cleaned))
+
+
+def local_url(host: str, port: int) -> str:
+    """The URL this machine reaches a server listening on host:port at."""
+    if host in ("0.0.0.0", ""):
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    if ":" in host:  # an IPv6 address needs brackets inside a URL
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
 
 
 def load_config() -> Config:

@@ -12,8 +12,13 @@ of its channels, and ffmpeg addresses devices by number rather than by name:
 So this backend only has to translate the device name from config.yaml into
 its index, and the requested channel numbers straight into channel indexes of
 that one device.
+
+No longer the default on macOS, and only used when config.yaml asks for it by
+name: ffmpeg loses audio capturing this way (see macos_capture.py), so every
+recording made through it is logged with a warning.
 """
 
+import logging
 import re
 
 from .base import CaptureBackend, CaptureInput, DeviceNotFoundError, pan_to_stereo
@@ -24,11 +29,21 @@ from .base import CaptureBackend, CaptureInput, DeviceNotFoundError, pan_to_ster
 AUDIO_HEADER = "audio devices:"
 DEVICE_LINE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
 
+logger = logging.getLogger("recording_api")
+
 
 class AVFoundationBackend(CaptureBackend):
     framework = "avfoundation"
 
     def capture_input(self, left_channel: int, right_channel: int) -> CaptureInput:
+        # Per recording rather than once at start-up, so that a config.yaml
+        # left on this setting by accident shows up next to every recording it
+        # damaged.
+        logger.warning(
+            "recording through ffmpeg's avfoundation capture, which drops audio "
+            "(about a tenth of it when measured). Set 'framework: auto' in "
+            "config.yaml to use the audioqueue capture instead."
+        )
         device_index = self.find_device_index()
         return CaptureInput(
             # avfoundation names inputs "<video>:<audio>"; the empty half
