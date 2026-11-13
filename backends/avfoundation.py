@@ -14,7 +14,7 @@ its index, and the requested channel numbers straight into channel indexes of
 that one device.
 
 No longer the default on macOS, and only used when config.yaml asks for it by
-name: ffmpeg loses audio capturing this way (see macos_capture.py), so every
+name: ffmpeg loses audio capturing this way (see audioqueue.py), so every
 recording made through it is logged with a warning.
 """
 

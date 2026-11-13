@@ -11,12 +11,15 @@ The YAML keys are camelCase and the Python attributes are snake_case; the
 aliases below map between the two.
 """
 
+import ipaddress
+from ipaddress import IPv4Network, IPv6Network
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
+EXAMPLE_CONFIG_PATH = Path(__file__).parent / "config.example.yaml"
 DEFAULT_LOG_PATH = Path(__file__).parent / "recording_api.log"
 
 
@@ -27,20 +30,22 @@ class Config(BaseModel):
     # silently never applies.
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    api_version: str = Field("0.0.1", alias="apiVersion")
     # How the audio device is read: "auto" picks audioqueue on macOS and dshow
     # on Windows. "avfoundation" is ffmpeg's own macOS capture, kept only for
     # comparison because it loses audio. See backends/__init__.py.
     framework: str = "auto"
-    # Matched against the device names ffmpeg reports, so on Windows this one
-    # name matches every "DVS Receive N-M (Dante Virtual Soundcard)" pair.
+    # The name of the audio device to record from. On Windows it is matched
+    # against part of the name, so this one setting covers every
+    # "DVS Receive N-M (Dante Virtual Soundcard)" pair.
     input_device: str = Field(alias="inputDevice")
     # MP3 quality / file size trade-off, e.g. "128k".
     bitrate: str = "128k"
     # How many milliseconds of audio the capture may hold before any is lost,
     # which is what rides out a moment where the machine is busy. On Windows it
     # is dshow's buffer, and None leaves it at the device default. On macOS it
-    # is the length of the capture queue, and None means two seconds.
+    # is the length of the capture queue, which is never shorter than two
+    # seconds whatever is set here — so a value chosen for Windows is safe in a
+    # config that is copied to the Mac.
     audio_buffer_ms: int | None = Field(None, alias="audioBufferMs")
     # Where finished recordings are written, under a folder per room and a
     # folder per service inside it. All of it created on demand.
@@ -56,12 +61,21 @@ class Config(BaseModel):
     # Read once at start-up, so changing either needs a restart of the server.
     listen_host: str = Field("127.0.0.1", alias="listenHost")
     listen_port: int = Field(8000, alias="listenPort", ge=1, le=65535)
+    # Which other machines may use the API, as addresses (192.168.1.50) or
+    # ranges (192.168.1.0/24). The API has no log-in, so once it listens on
+    # the network this list is what decides who can start and stop recordings.
+    # Left empty, every address that can reach the port is accepted. Requests
+    # from this machine itself are always accepted — see allows(). Read once at
+    # start-up, like the listen address.
+    accept_requests_from: list[IPv4Network | IPv6Network] = Field(
+        default_factory=list, alias="acceptRequestsFrom"
+    )
     # What this server calls itself when more than one reports to the same
     # Companion — a Mac and a Windows machine recording the same rooms, say. It
     # becomes part of the custom variable name, recording_status_<serverName>,
     # so each server has a variable of its own instead of both overwriting one.
-    # Left unset the variable stays plain recording_status, as it was before
-    # there were two. Restricted to what a Companion variable name may contain.
+    # Left unset, the variable is plain recording_status. Restricted to what a
+    # Companion variable name may contain.
     server_name: str | None = Field(
         None, alias="serverName", pattern=r"^[A-Za-z0-9_]+$"
     )
@@ -81,22 +95,54 @@ class Config(BaseModel):
         """
         return local_url(self.listen_host, self.listen_port)
 
-    @model_validator(mode="before")
+    def allows(self, client: str | None, server: str | None = None) -> bool:
+        """Whether a request from the address `client` may use the API.
+
+        `server` is the address the request arrived at. A request whose two
+        ends are the same address was made on this machine, whatever address
+        it used to reach itself, and this machine is always allowed: the
+        restart scripts and a Companion running alongside depend on it.
+        """
+        if not self.accept_requests_from:
+            return True
+        try:
+            address = ipaddress.ip_address(client or "")
+        except ValueError:
+            # No address, or not one we can read. With a list in force, what
+            # cannot be identified is not let in.
+            return False
+        # A server listening on "::" sees IPv4 callers as ::ffff:192.168.1.50.
+        if address.version == 6 and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if address.is_loopback or client == server:
+            return True
+        return any(address in network for network in self.accept_requests_from)
+
+    @field_validator("accept_requests_from", mode="before")
     @classmethod
-    def reject_renamed_url_key(cls, data: object) -> object:
-        # companionBaseUrls used to be companionBaseUrl and hold a single
-        # address, so a config.yaml written before that change — or copied over
-        # from the other machine — arrives here. extra="forbid" would reject it
-        # anyway, but only as "extra inputs are not permitted", which doesn't
-        # say what to write instead. This is the one error that stops the server
-        # from starting at all, so it is worth spelling out.
-        if isinstance(data, dict) and "companionBaseUrl" in data:
+    def parse_accept_requests_from(cls, entries: object) -> object:
+        if entries is None:
+            return []  # the key written with nothing under it
+        if isinstance(entries, str):
             raise ValueError(
-                "companionBaseUrl has been replaced by companionBaseUrls, which "
-                "takes a list so the status can go to more than one Companion. "
-                f"Write it as:\ncompanionBaseUrls:\n  - {data['companionBaseUrl']}"
+                "expected a list of addresses, not a single one. Write it as:\n"
+                f"acceptRequestsFrom:\n  - {entries}"
             )
-        return data
+        networks = []
+        for entry in entries:
+            try:
+                # strict=False so "192.168.1.50/24" means the range that
+                # address is in, rather than being an error.
+                networks.append(ipaddress.ip_network(str(entry).strip(), strict=False))
+            except ValueError:
+                # Raised afresh because ipaddress's own message would have to
+                # be decoded, and a name instead of a number is the likely slip.
+                raise ValueError(
+                    f"{entry!r} is not an address or a range. Write an address "
+                    "such as 192.168.1.50 or a range such as 192.168.1.0/24; "
+                    "machine names are not looked up."
+                ) from None
+        return networks
 
     @field_validator("companion_base_urls", mode="before")
     @classmethod
@@ -135,7 +181,18 @@ def local_url(host: str, port: int) -> str:
 
 
 def load_config() -> Config:
-    # Called per request rather than cached, so edits to config.yaml take
-    # effect without restarting the server.
-    with open(CONFIG_PATH, "r") as file:
-        return Config(**yaml.safe_load(file))
+    # Called per request rather than cached, so the settings a recording uses
+    # (device, framework, bitrate, buffer, output folder) take effect on the
+    # next recording without restarting the server. The rest are read once at
+    # start-up: the listen address, who requests are accepted from, the
+    # Companion addresses, the push rate, the server name and the log path.
+    try:
+        with open(CONFIG_PATH, "r") as file:
+            return Config(**yaml.safe_load(file))
+    except FileNotFoundError:
+        # config.yaml is this machine's own and is not in the repository, so on
+        # a fresh copy of the project it does not exist yet.
+        raise FileNotFoundError(
+            f"{CONFIG_PATH.name} not found. Copy {EXAMPLE_CONFIG_PATH.name} to "
+            f"{CONFIG_PATH.name} in {CONFIG_PATH.parent} and fill it in."
+        ) from None

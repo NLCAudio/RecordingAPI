@@ -4,7 +4,7 @@ Capture backends
 
 Picks the right capture backend for the machine we are running on. Set
 `framework` in config.yaml to force one (useful for testing), or leave it at
-"auto" to let the platform decide — the same config file then works on both
+"auto" to let the platform decide, so that setting never has to differ between
 the Mac and the Windows box.
 """
 

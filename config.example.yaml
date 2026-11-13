@@ -1,0 +1,56 @@
+# Recording API settings.
+#
+# This file is the template. Copy it to config.yaml, which is each machine's
+# own and is not kept in the repository, and change what differs there.
+# config.py describes every setting in full.
+
+# How the audio device is read. auto picks audioqueue on macOS and dshow on
+# Windows, and is what you want.
+framework: auto
+
+# The audio device to record from. On Windows this is matched against part of
+# the name, so it covers every "DVS Receive N-M (Dante Virtual Soundcard)" pair.
+inputDevice: "Dante Virtual Soundcard"
+
+# MP3 bitrate.
+bitrate: 128k
+
+# How many milliseconds of audio the capture may hold before any is lost. Leave
+# unset for the default. On Windows that is the device's own, and this is the
+# setting to raise if recordings drop audio. On macOS the capture always holds
+# at least 2000, and the log says "lost ... ms of audio" if that was not enough.
+# audioBufferMs: 200
+
+# Recordings are filed as <outputPath>/<room>/<service>/<file>.mp3; the folders
+# are created on demand.
+outputPath: ./recordings
+logPath: ./recording_api.log
+
+# Where the server listens. 127.0.0.1 only accepts requests from this machine.
+# 0.0.0.0 accepts them from other machines as well, which is needed when
+# Companion runs elsewhere; on Windows that also needs an inbound firewall rule
+# for the port. Changing either needs a restart of the server.
+listenHost: 127.0.0.1
+listenPort: 8080
+
+# Which other machines may use the API: addresses, or ranges such as
+# 192.168.1.0/24. The API has no log-in, so set this whenever listenHost lets
+# other machines in, normally to the machine Companion runs on. A request from
+# any other address is refused. This machine itself is always allowed. Left
+# out, every address is accepted. Changing it needs a restart of the server.
+# acceptRequestsFrom:
+#   - 192.168.1.50
+
+# Set this when two servers report to the same Companion: "mac" on one and
+# "windows" on the other, say. The status is then pushed to the custom variable
+# recording_status_<serverName> instead of recording_status, so the two do not
+# overwrite each other. Letters, digits and underscores only.
+# serverName: mac
+
+# Every Companion instance the status is pushed to, one per line. Each gets its
+# own push thread, so one machine being switched off does not slow the others.
+companionBaseUrls:
+  - http://127.0.0.1:8000/
+
+# How many times a second the status is pushed.
+# statusPushRefreshHz: 15

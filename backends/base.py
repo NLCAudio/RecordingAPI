@@ -2,16 +2,19 @@
 Capture backend interface
 =========================
 
-Every operating system exposes audio devices to ffmpeg differently, so the
-device-specific knowledge lives here instead of being spread through main.py.
+Every operating system exposes audio devices differently, so the
+device-specific knowledge lives in the backends instead of being spread
+through recording.py.
 
 A backend answers exactly one question:
 
-    "I want channel L on the left and channel R on the right — which ffmpeg
-     inputs do I open, and how do I route them into a stereo stream?"
+    "I want channel L on the left and channel R on the right — where does
+     ffmpeg get that audio, and how is it routed into a stereo stream?"
 
+Either ffmpeg opens the device itself (Windows), or the backend reads the
+device and feeds ffmpeg through a pipe (macOS); CaptureInput covers both.
 Everything after that (encoding to MP3, measuring dB levels, writing the file)
-is identical on every platform and stays in main.py.
+is identical on every platform and stays in recording.py.
 
 Channel numbers used by this interface are 1-based, exactly like the channel
 numbers shown in Dante Controller: channel 1 is the first channel.
@@ -25,12 +28,12 @@ from typing import BinaryIO, Protocol
 
 from config import Config
 
-# How many audio packets ffmpeg may queue up before it starts dropping them.
-# The capture device hands ffmpeg one small buffer at a time and the OS
-# silently discards audio while ffmpeg is busy, so any downstream stall (disk,
-# encoder, thread scheduling) longer than a few tens of milliseconds becomes an
-# audible glitch. A deep queue lets the input thread keep draining the device
-# through such stalls.
+# How many audio packets ffmpeg may queue between reading a device and
+# processing them, on the backends where ffmpeg reads the device itself. A deep
+# queue lets its reader keep draining the device through a stall further down
+# (disk, encoder, thread scheduling). It does nothing about audio lost before
+# that reader, which is how avfoundation loses it, and whether dshow needs it
+# has not been measured.
 THREAD_QUEUE_SIZE = "4096"
 
 
@@ -41,13 +44,13 @@ class CaptureInput:
     # Every argument from the first -f up to and including the last -i.
     args: list[str]
     # A filter graph consuming those inputs and producing one stereo stream,
-    # e.g. "[0:a]pan=stereo|c0=c0|c1=c1". main.py appends the level metering
-    # to it and maps the result into the output file. A backend that needs
-    # more than one input (Windows) also combines them here.
+    # e.g. "[0:a]pan=stereo|c0=c0|c1=c1". recording.py appends the level
+    # metering to it and maps the result into the output file. A backend that
+    # needs more than one input (Windows) also combines them here.
     filter_prefix: str
     # Set when the audio does not come from an ffmpeg input device but is
     # written into ffmpeg's stdin by the server (macOS). The recording then
-    # starts by calling feeder.start(<ffmpeg's stdin>) and ends by calling
+    # starts by calling feeder.start() with ffmpeg's stdin and ends by calling
     # feeder.stop(), which closes that pipe — instead of sending ffmpeg "q".
     feeder: "AudioFeeder | None" = None
 
@@ -55,8 +58,11 @@ class CaptureInput:
 class AudioFeeder(Protocol):
     """Something that writes one recording's audio into ffmpeg's stdin."""
 
-    def start(self, sink: BinaryIO) -> None:
-        """Begin writing into sink. Raises OSError if the device won't open."""
+    def start(self, sink: BinaryIO, label: str) -> None:
+        """Begin writing into sink; label names the recording in log lines.
+
+        Raises OSError if the device won't open, leaving sink untouched.
+        """
 
     def stop(self) -> None:
         """Write what is left and close the sink. Safe to call twice."""
@@ -73,9 +79,9 @@ def pan_to_stereo(left_index: int, right_index: int) -> str:
 
 
 class DeviceNotFoundError(RuntimeError):
-    """The configured input device is not among the devices ffmpeg listed."""
+    """The configured input device is not among the devices that were found."""
 
-    def __init__(self, requested: str, found_devices: list[str], *args):
+    def __init__(self, requested: str, found_devices: list[str]):
         self.requested = requested
         self.found_devices = found_devices
         self.message = (
@@ -87,13 +93,14 @@ class DeviceNotFoundError(RuntimeError):
 class ChannelNotAvailableError(RuntimeError):
     """The requested channels exist, but not in a form we can record."""
 
-    def __init__(self, message: str, *args):
+    def __init__(self, message: str):
         self.message = message
         super().__init__(message)
 
 
 class CaptureBackend(ABC):
-    # The value passed to ffmpeg's -f, e.g. "avfoundation" or "dshow".
+    # The name this backend is selected by with `framework` in config.yaml.
+    # Where ffmpeg opens the device itself, it is also the value of ffmpeg's -f.
     framework: str
 
     def __init__(self, config: Config):
@@ -120,6 +127,7 @@ class CaptureBackend(ABC):
             ],
             capture_output=True,
             text=True,
+            check=False,  # the non-zero exit is the normal case, as above
         )
         return result.stderr
 

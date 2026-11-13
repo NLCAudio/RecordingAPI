@@ -1,12 +1,14 @@
 """
-Background launcher
-===================
+Server launcher
+===============
 
-Starts the recording API without a console window, for machines where it
-should just be running whenever the operator is logged in.
+The way the recording API is started: by hand with `python run_server.py`, by
+the Windows scheduled task, and by the macOS launchd agent. It listens where
+listenHost and listenPort in config.yaml say, and notes that address in
+server.url for the restart scripts.
 
-Running `uvicorn main:app` from a terminal is fine for testing, but a
-background launcher has two problems this file solves:
+Running `uvicorn main:app` from a terminal is fine while developing, but a
+server started in the background has two problems this file solves:
 
   1. It starts in whatever folder the launcher happens to use — for Windows
      Task Scheduler that is C:\\Windows\\System32. The relative paths in
@@ -94,4 +96,13 @@ if __name__ == "__main__":
         # Only the restart scripts read it, and they fall back to config.yaml,
         # so this is no reason to keep the server from starting.
         pass
-    uvicorn.run("main:app", host=host, port=port, log_config=LOG_CONFIG)
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        log_config=LOG_CONFIG,
+        # There is no proxy in front of this server, so the address a request
+        # comes from is the address of the machine that sent it — which is
+        # what acceptRequestsFrom checks — and never one a header claims.
+        proxy_headers=False,
+    )

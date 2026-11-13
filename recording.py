@@ -3,8 +3,9 @@ Recording sessions
 ==================
 
 Owns everything about recordings that are currently running: the ffmpeg
-processes, the live audio levels read back from them, and the bookkeeping that
-keeps the two in step.
+processes, the capture feeding them where ffmpeg does not read the device
+itself, the live audio levels read back from them, and the bookkeeping that
+keeps all of it in step.
 
 All of that state lives inside SessionRegistry, which holds the locks that
 protect it. Callers never take a lock themselves — they call a registry method
@@ -70,6 +71,10 @@ STOP_TIMEOUT_S = 10
 # more (audio has reached the encoder), so it counts too, in relay_ffmpeg_output.
 # Two spellings because one wording change in a future ffmpeg must not leave
 # every start unconfirmed.
+#
+# Where a feeder supplies the audio, ffmpeg's input is a pipe and these lines
+# say nothing about the device. They do not need to: the feeder opens the
+# device itself before a session exists, and raises if it cannot.
 STARTED_MARKER = re.compile(rb"Press \[q\] to stop|Output #\d+,")
 
 # The backstop for an ffmpeg that neither confirms nor exits — a device that
@@ -103,7 +108,9 @@ def format_time(seconds: int) -> str:
 # callers send to the start/stop/toggle endpoints, which FastAPI validates for
 # us. Channels are numbered the way Dante Controller numbers them, from 1.
 class RecordingRequest(BaseModel):
-    room_name: str = "room_name"
+    # Required: it is what a recording is found by again when it is stopped, so
+    # a request without one must be refused rather than filed under a default.
+    room_name: str
     service_name: str = "service_name"
     left_input_channel: int = 1  # which input channel maps to the left side
     right_input_channel: int = 2  # which input channel maps to the right side
@@ -275,6 +282,25 @@ class SessionRegistry:
                 return False, self.stop(request.room_name)
             return True, self.start(request, config)
 
+    def stop_all(self) -> list[str]:
+        """Stop every room that is recording; returns the rooms that were.
+
+        For when the server itself is shutting down. Stopped one by one through
+        stop(), so each MP3 is finalised exactly as it is for a stop request.
+        """
+        with self._state_lock:
+            rooms = list(self._sessions)
+
+        stopped = []
+        for room_name in rooms:
+            try:
+                if self.stop(room_name) is not None:
+                    stopped.append(room_name)
+            except Exception:
+                # One room failing to stop must not leave the others running.
+                logger.exception("[%s] could not be stopped", room_name)
+        return stopped
+
     def set_level(self, room_name: str, session: Session, channel: int, db: float):
         with self._state_lock:
             # Guard against a race where the reader thread outlives its session.
@@ -311,7 +337,7 @@ def build_recording_cmd(
         # Suppress the size=/time= progress ticker, which would otherwise
         # clutter the log (it is written with \r, not newlines).
         "-nostats",
-        *capture_input.args,  # -f <framework> ... -i <device>, one set per input
+        *capture_input.args,  # -f <format> ... -i <source>, one set per input
         "-filter_complex",
         f"{capture_input.filter_prefix},{LEVEL_METERING_FILTER}[out]",
         "-map",
@@ -455,9 +481,9 @@ def confirm_started(room_name: str, session: Session) -> None:
 
 
 def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
-    # Ask the platform's backend which ffmpeg inputs carry the requested
-    # channels. Resolved per recording because devices come and go (Dante
-    # Virtual Soundcard restarting, for instance).
+    # Ask the platform's backend where ffmpeg gets the requested channels from.
+    # Resolved per recording because devices come and go (Dante Virtual
+    # Soundcard restarting, for instance).
     capture_input = get_backend(config).capture_input(
         request.left_input_channel, request.right_input_channel
     )
@@ -478,12 +504,16 @@ def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
 
     if capture_input.feeder is not None:
         try:
-            capture_input.feeder.start(process.stdin)
+            capture_input.feeder.start(process.stdin, request.room_name)
         except OSError:
             # The device would not open. ffmpeg is already running and would
-            # wait for audio forever, so take it down before reporting why.
+            # wait for audio forever, so take it down before reporting why —
+            # and take the file it has just created with it, which holds no
+            # audio and would otherwise sit there looking like a recording.
             process.kill()
             process.wait()
+            close_pipes(process)
+            Path(out_path).unlink(missing_ok=True)
             raise
 
     return Session(
@@ -513,14 +543,29 @@ def stop_ffmpeg(session: Session) -> None:
         process.wait()
 
 
+def close_pipes(process: subprocess.Popen) -> None:
+    """Let go of our ends of the pipes to an ffmpeg that has exited.
+
+    Python would close them eventually, when the session is forgotten and
+    collected. Doing it here means a server that records for months holds no
+    more open pipes than it has recordings running.
+    """
+    for pipe in (process.stdin, process.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass  # something unsent to an ffmpeg that is no longer there
+
+
 def send_quit(process: subprocess.Popen) -> None:
     # Ask ffmpeg to stop by sending the "q" key over its stdin, which lets it
     # finalise the MP3 properly (write headers, flush buffers).
     try:
         process.stdin.write(b"q")
         process.stdin.flush()
-    except (BrokenPipeError, OSError):
-        # stdin is already closed — fall back to a signal instead. Windows
+    except (BrokenPipeError, OSError, ValueError):
+        # stdin is already closed, by ffmpeg (an OSError) or by us because it
+        # had just exited (a ValueError) — fall back to a signal instead. Windows
         # cannot deliver SIGINT to another process (send_signal rejects it),
         # so there we can only terminate, which loses the last buffered
         # fraction of a second rather than finalising the file cleanly.
@@ -566,8 +611,7 @@ def sync_to_disk(room_name: str, session: Session) -> None:
                 # than log this once a tick for the length of a service, say it
                 # plainly and leave the rest to -flush_packets.
                 logger.warning(
-                    "[%s] cannot flush %s to disk; recording continues "
-                    "unsynced: %s",
+                    "[%s] cannot flush %s to disk; recording continues unsynced: %s",
                     room_name,
                     session.path,
                     e,
@@ -638,22 +682,31 @@ def relay_ffmpeg_output(
     finally:
         # wait() rather than poll(): stderr reaching EOF only means ffmpeg
         # closed the pipe, and poll() returns None until the process is
-        # actually reaped, which is why exits used to be logged as "code None".
+        # actually reaped, so the exit code would not be known yet.
         code = process.wait()
         session.exit_code = code
+        # Set once the exit code and the reason are final, and before anything
+        # below that could take time: a start still waiting on this has to
+        # learn that ffmpeg is gone within its own timeout. Does nothing if the
+        # recording ran normally and confirmed itself long ago.
+        session.startup_settled.set()
         # ffmpeg has written the last of the file and gone, so release the disk
         # syncer to make its final pass over it.
         session.ffmpeg_finished.set()
-        # If ffmpeg ended by itself there is nobody left to record for; let go
-        # of the device. Does nothing after a normal stop, which already has.
-        if session.feeder is not None:
-            session.feeder.stop()
-        # Set last, so that a start still waiting on this reads an exit code and
-        # a reason that are already final. Does nothing if the recording ran
-        # normally and confirmed itself long ago.
-        session.startup_settled.set()
         # A non-zero exit means ffmpeg gave up — the file is likely truncated
         # or missing, so it belongs at a level the log can be filtered for.
         log = logger.info if code == 0 else logger.error
         log("[%s] ffmpeg exited with code %s", room_name, code)
         registry.silence_levels(room_name, session)
+        if session.feeder is None:
+            close_pipes(process)
+        else:
+            # If ffmpeg ended by itself there is nobody left to record for; let
+            # go of the device. Does nothing after a normal stop, which already
+            # has. The pipe into ffmpeg is the feeder's to close: it may still
+            # be in the middle of a write to it.
+            try:
+                session.feeder.stop()
+            except Exception:
+                logger.exception("[%s] could not release the audio device", room_name)
+            process.stderr.close()

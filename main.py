@@ -32,9 +32,9 @@ This file holds only the HTTP layer. The work behind it lives in:
   backends/     — how each operating system exposes audio devices to ffmpeg
 """
 
-# TODO: write to a local folder, then push to one drive
-
+import ipaddress
 import logging
+import time
 from contextlib import asynccontextmanager, contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -50,7 +50,7 @@ from starlette.responses import JSONResponse
 
 from backends import ChannelNotAvailableError, DeviceNotFoundError
 from companion import start_status_push, variable_name
-from config import DEFAULT_LOG_PATH, load_config
+from config import DEFAULT_LOG_PATH, Config, load_config
 from recording import RecordingRequest, SessionRegistry
 
 # Application log. Everything ffmpeg prints on stderr — except the per-second
@@ -63,6 +63,19 @@ logger = logging.getLogger("recording_api")
 # Every room that is currently recording. Owns its own locking, so nothing
 # here has to coordinate between the request threads and the push thread.
 registry = SessionRegistry()
+
+# The config the server started with, None until it has. Who may use the API is
+# decided by the acceptRequestsFrom list in here — not by whatever config.yaml
+# says by the time a request arrives — so it cannot change under a running
+# service by accident.
+startup_config: Config | None = None
+
+# How often a refused address is written to the log. A machine that is not on
+# the list and retries many times a second would otherwise bury everything else.
+REFUSAL_LOG_INTERVAL_S = 60.0
+
+# When each refused address was last logged.
+refusals_logged_at: dict[str, float] = {}
 
 
 def setup_logging(log_path: Path) -> None:
@@ -95,6 +108,21 @@ async def lifespan(app: FastAPI):
         raise
 
     setup_logging(config.log_path)
+    global startup_config
+    startup_config = config
+    if config.accept_requests_from:
+        logger.info(
+            "Accepting requests from this machine and from %s",
+            ", ".join(str(network) for network in config.accept_requests_from),
+        )
+    elif accepts_other_machines(config.listen_host):
+        logger.warning(
+            "listenHost %s accepts requests from other machines and "
+            "acceptRequestsFrom is empty, so any machine that can reach port %d "
+            "can start and stop recordings",
+            config.listen_host,
+            config.listen_port,
+        )
     # When the server starts up, launch one status-push loop per configured
     # Companion address in the background.
     start_status_push(registry, config)
@@ -104,9 +132,69 @@ async def lifespan(app: FastAPI):
         variable_name(config.server_name),
     )
     yield
+    # The server is being shut down: the machine is restarting, or someone is
+    # logging out. Stop what is recording so each MP3 is finalised properly,
+    # rather than cut off wherever ffmpeg happened to be.
+    stopped = registry.stop_all()
+    if stopped:
+        logger.info("server shutting down; stopped recording in %s", ", ".join(stopped))
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def accepts_other_machines(listen_host: str) -> bool:
+    """Whether a server listening on this address can be reached from outside."""
+    if listen_host == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(listen_host).is_loopback
+    except ValueError:
+        return True  # some other name; assume it resolves to a real address
+
+
+@app.middleware("http")
+async def refuse_unlisted_addresses(request: Request, call_next):
+    """Turn away requests from addresses not listed under acceptRequestsFrom.
+
+    The one place access is decided: for every endpoint, and the same way on
+    macOS and Windows, so nothing depends on how each machine's firewall
+    happens to be set up.
+    """
+    client = request.client.host if request.client else None
+    server = request.scope.get("server")
+    if startup_config is None or startup_config.allows(
+        client, server[0] if server else None
+    ):
+        return await call_next(request)
+
+    log_refusal(client, request)
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "This address is not allowed to use the recording API"},
+    )
+
+
+def log_refusal(client: str | None, request: Request) -> None:
+    now = time.monotonic()
+    address = client or "an unknown address"
+    last_logged = refusals_logged_at.get(address)
+    if last_logged is not None and now - last_logged < REFUSAL_LOG_INTERVAL_S:
+        return
+
+    if len(refusals_logged_at) >= 1000:
+        # Only reachable if the server is exposed to far more machines than it
+        # should be; keeps this from growing for as long as it runs.
+        refusals_logged_at.clear()
+    refusals_logged_at[address] = now
+    logger.warning(
+        "refused %s %s from %s, which is not listed under acceptRequestsFrom (further "
+        "requests from it are not logged for the next %.0f s)",
+        request.method,
+        request.url.path,
+        address,
+        REFUSAL_LOG_INTERVAL_S,
+    )
 
 
 class LoggedHTTPException(HTTPException):

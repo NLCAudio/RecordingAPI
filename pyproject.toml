@@ -10,6 +10,3 @@ dependencies = [
     "requests>=2.32",
     "pyyaml>=6.0",
 ]
-
-[tool.fastapi]
-entrypoint = "main:app"

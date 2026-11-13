@@ -135,9 +135,7 @@ class DShowBackend(CaptureBackend):
                 )
 
         if not matched_any:
-            raise DeviceNotFoundError(
-                requested=requested, found_devices=list(devices)
-            )
+            raise DeviceNotFoundError(requested=requested, found_devices=list(devices))
 
         return channels
 
