@@ -13,10 +13,31 @@
 set -uo pipefail
 
 LABEL="${RECORDING_API_LABEL:-local.recording-api}"
-BASE_URL="${RECORDING_API_URL:-http://127.0.0.1:8000}"
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE="gui/$(id -u)/$LABEL"
+
+# Where to reach the server: worked out from listenHost and listenPort in
+# config.yaml, by the same code the server reads them with. RECORDING_API_URL
+# overrides it. The fallback is the address used when neither is set.
+BASE_URL="${RECORDING_API_URL:-}"
+if [ -z "$BASE_URL" ]; then
+    if ! BASE_URL="$(cd "$PROJECT_DIR" && "$PROJECT_DIR/.venv/bin/python" -c \
+        'from config import load_config; print(load_config().local_url)' 2>/dev/null)" ||
+        [ -z "$BASE_URL" ]; then
+        BASE_URL="http://127.0.0.1:8000"
+        echo "warning: could not read the address from config.yaml; trying $BASE_URL" >&2
+    fi
+fi
+
+# The server that is running now may not be at that address: if listenHost or
+# listenPort was edited since it started, it is still where it was. It wrote
+# that down when it started, so ask it there — and wait for the new one, at
+# the end, at the address from config.yaml.
+RUNNING_URL="$BASE_URL"
+if [ -z "${RECORDING_API_URL:-}" ] && [ -s "$PROJECT_DIR/server.url" ]; then
+    RUNNING_URL="$(head -n 1 "$PROJECT_DIR/server.url" | tr -d '[:space:]')"
+fi
 
 FORCE=""
 case "${1:-}" in
@@ -43,7 +64,7 @@ fi
 # A server that is not answering is not an error here: restarting one that is
 # already down is just starting it.
 rooms=()
-if status_json="$(curl -fsS --max-time 5 "$BASE_URL/status" 2>/dev/null)"; then
+if status_json="$(curl -fsS --max-time 5 "$RUNNING_URL/status" 2>/dev/null)"; then
     # One room per line, because room names contain spaces.
     while IFS= read -r room; do
         [ -n "$room" ] && rooms+=("$room")
@@ -53,7 +74,7 @@ for room in json.load(sys.stdin).get("sessions", {}):
     print(room)
 ')
 else
-    echo "No server answering on $BASE_URL (it may already be stopped)."
+    echo "No server answering on $RUNNING_URL (it may already be stopped)."
 fi
 
 # --- 2. Stop recordings properly, before anything is killed ------------------
@@ -77,7 +98,7 @@ if [ "${#rooms[@]}" -gt 0 ]; then
         # Worth continuing if this fails: the restart is still wanted, and the
         # flush settings leave a killed recording playable regardless.
         curl -fsS --max-time 30 -X POST -H 'Content-Type: application/json' \
-            -d "$body" "$BASE_URL/recording/stop" >/dev/null ||
+            -d "$body" "$RUNNING_URL/recording/stop" >/dev/null ||
             echo "  warning: could not stop $room cleanly" >&2
     done
 fi

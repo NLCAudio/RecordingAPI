@@ -17,8 +17,9 @@
     exists, the server is started directly instead.
 
 .PARAMETER BaseUrl
-    Where to reach the server from this machine. Must use the listenPort set
-    in config.yaml.
+    Where to reach the server from this machine. Left out, the running server
+    is looked for at the address it recorded in server.url when it started,
+    and the restarted one at listenHost and listenPort from config.yaml.
 
 .PARAMETER Force
     Restart without asking, even if rooms are recording. For unattended use.
@@ -32,7 +33,7 @@
 [CmdletBinding()]
 param(
     [string] $TaskName = 'RecordingAPI',
-    [string] $BaseUrl = 'http://127.0.0.1:8000',
+    [string] $BaseUrl = '',
     [switch] $Force
 )
 
@@ -41,16 +42,58 @@ $ErrorActionPreference = 'Stop'
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $Launcher = Join-Path $ProjectDir 'run_server.py'
 
+# Where to reach the server: worked out from listenHost and listenPort in
+# config.yaml, by the same code the server reads them with, unless -BaseUrl
+# was given. python.exe rather than pythonw.exe, which has no output to read.
+$RunningUrl = $BaseUrl
+if (-not $BaseUrl) {
+    $python = Join-Path $ProjectDir '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $python)) { $python = 'python.exe' }
+
+    $answer = $null
+    Push-Location $ProjectDir
+    try {
+        $answer = & $python -c 'from config import load_config; print(load_config().local_url)' 2>$null |
+            Select-Object -Last 1
+    }
+    catch {
+        $answer = $null
+    }
+    finally {
+        Pop-Location
+    }
+
+    if ($answer -and "$answer".Trim() -like 'http*') {
+        $BaseUrl = "$answer".Trim()
+    }
+    else {
+        # The address used when config.yaml sets neither value.
+        $BaseUrl = 'http://127.0.0.1:8000'
+        Write-Warning "Could not read the address from config.yaml; trying $BaseUrl"
+    }
+
+    # The server that is running now may not be at that address: if listenHost
+    # or listenPort was edited since it started, it is still where it was. It
+    # wrote that down when it started, so ask it there -- and wait for the new
+    # one, at the end, at the address from config.yaml.
+    $RunningUrl = $BaseUrl
+    $urlFile = Join-Path $ProjectDir 'server.url'
+    if (Test-Path -LiteralPath $urlFile) {
+        $recorded = "$(Get-Content -LiteralPath $urlFile -TotalCount 1)".Trim()
+        if ($recorded -like 'http*') { $RunningUrl = $recorded }
+    }
+}
+
 # --- 1. Ask the running server what it is doing -------------------------------
 
 # A server that is not running is not an error here: restarting one that is
 # already down is just starting it.
 $status = $null
 try {
-    $status = Invoke-RestMethod -Uri "$BaseUrl/status" -TimeoutSec 5
+    $status = Invoke-RestMethod -Uri "$RunningUrl/status" -TimeoutSec 5
 }
 catch {
-    Write-Host "No server answering on $BaseUrl (it may already be stopped)."
+    Write-Host "No server answering on $RunningUrl (it may already be stopped)."
 }
 
 $rooms = @()
@@ -79,7 +122,7 @@ if ($rooms.Count -gt 0) {
         Write-Host "Stopping recording in $room ..."
         $body = @{ room_name = $room } | ConvertTo-Json -Compress
         try {
-            $result = Invoke-RestMethod -Method Post -Uri "$BaseUrl/recording/stop" `
+            $result = Invoke-RestMethod -Method Post -Uri "$RunningUrl/recording/stop" `
                 -ContentType 'application/json' -Body $body -TimeoutSec 30
             Write-Host "  saved $($result.file)"
         }

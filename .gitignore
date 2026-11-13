@@ -222,3 +222,6 @@ __marimo__/
 *.mp3
 .DS_Store
 recordings/*
+
+# Written by run_server.py at start-up: the address this machine's server is on.
+server.url

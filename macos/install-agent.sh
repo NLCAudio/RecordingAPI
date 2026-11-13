@@ -20,7 +20,6 @@
 set -euo pipefail
 
 LABEL="${RECORDING_API_LABEL:-local.recording-api}"
-BASE_URL="${RECORDING_API_URL:-http://127.0.0.1:8000}"
 
 # This script lives in <project>/macos, so the project is one level up.
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,6 +27,19 @@ LAUNCHER="$PROJECT_DIR/run_server.py"
 PYTHON="$PROJECT_DIR/.venv/bin/python"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
+
+# Where to reach the server: worked out from listenHost and listenPort in
+# config.yaml, by the same code the server reads them with. RECORDING_API_URL
+# overrides it. The fallback is the address used when neither is set.
+BASE_URL="${RECORDING_API_URL:-}"
+if [ -z "$BASE_URL" ]; then
+    if ! BASE_URL="$(cd "$PROJECT_DIR" && "$PROJECT_DIR/.venv/bin/python" -c \
+        'from config import load_config; print(load_config().local_url)' 2>/dev/null)" ||
+        [ -z "$BASE_URL" ]; then
+        BASE_URL="http://127.0.0.1:8000"
+        echo "warning: could not read the address from config.yaml; trying $BASE_URL" >&2
+    fi
+fi
 
 # Paths go into XML, where these three characters would end the document early.
 xml_escape() {

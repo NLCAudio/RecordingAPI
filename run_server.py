@@ -28,10 +28,17 @@ from pathlib import Path
 
 import uvicorn
 
-from config import Config, load_config
+from config import Config, load_config, local_url
 
 PROJECT_DIR = Path(__file__).parent
 SERVER_LOG = PROJECT_DIR / "server.log"
+
+# The address this run of the server is listening on, written at start-up for
+# the restart scripts. config.yaml only says where the *next* start will
+# listen: once listenHost or listenPort has been edited, the server that is
+# still running is somewhere else, and a restart has to find it there to stop
+# its recordings cleanly.
+SERVER_URL_FILE = PROJECT_DIR / "server.url"
 
 # Same rotation as the recording log in main.py: 5 MB, 3 old files kept, so a
 # machine that is never looked at can't fill its disk with log files.
@@ -81,4 +88,10 @@ def listen_address() -> tuple[str, int]:
 if __name__ == "__main__":
     os.chdir(PROJECT_DIR)
     host, port = listen_address()
+    try:
+        SERVER_URL_FILE.write_text(local_url(host, port) + "\n")
+    except OSError:
+        # Only the restart scripts read it, and they fall back to config.yaml,
+        # so this is no reason to keep the server from starting.
+        pass
     uvicorn.run("main:app", host=host, port=port, log_config=LOG_CONFIG)
