@@ -2,20 +2,19 @@
 macOS capture backend (avfoundation)
 ====================================
 
-On macOS the Dante Virtual Soundcard shows up as a single device carrying all
-of its channels, and ffmpeg addresses devices by number rather than by name:
+On macOS the Dante Virtual Soundcard is a single device carrying all of its
+channels, and ffmpeg addresses devices by number:
 
     [AVFoundation indev @ 0x...] AVFoundation audio devices:
     [AVFoundation indev @ 0x...] [0] Dante Virtual Soundcard
     [AVFoundation indev @ 0x...] [1] MacBook Pro Microphone
 
-So this backend only has to translate the device name from config.yaml into
-its index, and the requested channel numbers straight into channel indexes of
-that one device.
+So this backend only translates the device name from config.yaml into its
+index, and the requested channel numbers into channel indexes of that device.
 
-No longer the default on macOS, and only used when config.yaml asks for it by
-name: ffmpeg loses audio capturing this way (see audioqueue.py), so every
-recording made through it is logged with a warning.
+Not the default: ffmpeg loses audio capturing this way (see audioqueue.py). It
+is used only when config.yaml asks for it by name, and every recording made
+through it is logged with a warning.
 """
 
 import logging
@@ -23,9 +22,8 @@ import re
 
 from .base import CaptureBackend, CaptureInput, DeviceNotFoundError, pan_to_stereo
 
-# Everything after this line in ffmpeg's output is an audio device. The video
-# devices listed above it use the same "[N] name" shape, so we must not start
-# reading before it.
+# What follows this line in ffmpeg's output is an audio device. The video
+# devices above it have the same "[N] name" shape, so reading starts here.
 AUDIO_HEADER = "audio devices:"
 DEVICE_LINE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
 
@@ -36,9 +34,8 @@ class AVFoundationBackend(CaptureBackend):
     framework = "avfoundation"
 
     def capture_input(self, left_channel: int, right_channel: int) -> CaptureInput:
-        # Per recording rather than once at start-up, so that a config.yaml
-        # left on this setting by accident shows up next to every recording it
-        # damaged.
+        # Per recording, not once at start-up, so a config.yaml left on this
+        # setting by accident shows up next to every recording it damaged.
         logger.warning(
             "recording through ffmpeg's avfoundation capture, which drops audio "
             "(about a tenth of it when measured). Set 'framework: auto' in "
@@ -46,11 +43,11 @@ class AVFoundationBackend(CaptureBackend):
         )
         device_index = self.find_device_index()
         return CaptureInput(
-            # avfoundation names inputs "<video>:<audio>"; the empty half
-            # before the colon means "no video, audio device N only".
+            # avfoundation names inputs "<video>:<audio>"; an empty first half
+            # means no video, audio device N only.
             args=self.input_args(f":{device_index}"),
-            # One device carries every channel, so the channel numbers are the
-            # channel indexes, just counted from zero instead of one.
+            # One device carries every channel, so channel numbers are channel
+            # indexes, counted from zero instead of one.
             filter_prefix="[0:a]" + pan_to_stereo(left_channel - 1, right_channel - 1),
         )
 
@@ -72,8 +69,7 @@ class AVFoundationBackend(CaptureBackend):
         in_audio_section = False
 
         for line in self.list_devices_output().splitlines():
-            # Strip the "[AVFoundation indev @ 0x7f...]" prefix ffmpeg puts on
-            # every line so it does not interfere with the parsing below.
+            # Strip the "[AVFoundation indev @ 0x7f...]" prefix of every line.
             line = re.sub(r"^\[[^\]]+\]\s*", "", line)
 
             if AUDIO_HEADER in line.lower():
@@ -84,8 +80,8 @@ class AVFoundationBackend(CaptureBackend):
 
             match = DEVICE_LINE.match(line)
             if match is None:
-                # The device list ends at the first line that is not a device,
-                # which is the error about the empty input name.
+                # The list ends at the first line that is not a device: the
+                # error about the empty input name.
                 break
             devices[match.group(1)] = self.normalise(match.group(2))
 

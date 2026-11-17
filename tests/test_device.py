@@ -2,10 +2,10 @@ r"""
 A check of a real audio device, end to end
 ==========================================
 
-Records from the device through exactly the path the server uses, and fails if
-the recording comes out shorter than the time it ran for — which is how lost
-audio shows. It is the test to run on a machine before trusting it with a
-service, and after anything about its audio set-up changes.
+Records from the device through the same path the server uses, and fails if
+the recording is shorter than the time it ran for, which is how lost audio
+shows. Run it on a machine before trusting it with a service, and after any
+change to its audio set-up.
 
 It only runs when told which device to use:
 
@@ -17,14 +17,14 @@ It only runs when told which device to use:
         $env:RECORDING_API_TEST_DEVICE = "Dante Virtual Soundcard"
         python -m unittest tests.test_device -v
 
-Three more settings are optional:
+Optional settings:
 
     RECORDING_API_TEST_CHANNELS    left and right channel, default "1,2"
     RECORDING_API_TEST_SECONDS     how long to record, default 20
     RECORDING_API_TEST_FRAMEWORK   the `framework` setting to test, default "auto"
 
-The device does not need to be carrying sound: silence is recorded like
-anything else. The file is made in a temporary folder and removed afterwards.
+The device need not be carrying sound: silence is recorded like anything else.
+The file is made in a temporary folder and removed afterwards.
 """
 
 import os
@@ -41,10 +41,10 @@ CHANNELS = os.environ.get("RECORDING_API_TEST_CHANNELS", "1,2")
 SECONDS = float(os.environ.get("RECORDING_API_TEST_SECONDS", "20"))
 FRAMEWORK = os.environ.get("RECORDING_API_TEST_FRAMEWORK", "auto")
 
-# How much shorter than the time it ran for a recording may be. Starting ffmpeg
-# and opening the device takes a few tenths of a second, which is not loss. The
-# capture this project replaced on macOS lost a tenth of the audio, two seconds
-# of a twenty-second recording, so one second separates the two cleanly.
+# How much shorter than its running time a recording may be. Starting ffmpeg
+# and opening the device takes a few tenths of a second, which is not loss.
+# The capture this replaced on macOS lost two seconds in twenty, so one second
+# separates the two cleanly.
 ALLOWED_SHORTFALL_S = 1.0
 
 # Words in a log line that mean audio did not make it into the file: the macOS

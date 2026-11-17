@@ -2,10 +2,9 @@
 Capture backends
 ================
 
-Picks the right capture backend for the machine we are running on. Set
-`framework` in config.yaml to force one (useful for testing), or leave it at
-"auto" to let the platform decide, so that setting never has to differ between
-the Mac and the Windows box.
+Picks the capture backend for the machine we are running on. `framework` in
+config.yaml can force one (useful for testing); left at "auto", the platform
+decides, so the setting never has to differ between the Mac and the Windows box.
 """
 
 import sys
@@ -29,8 +28,8 @@ BACKENDS = {
 }
 
 FRAMEWORK_BY_PLATFORM = {
-    # Not avfoundation: ffmpeg loses audio capturing through it. It is still
-    # there to be asked for by name, for comparison.
+    # Not avfoundation: ffmpeg loses audio capturing through it. It can still
+    # be asked for by name, for comparison.
     "darwin": AudioQueueBackend.framework,
     "win32": DShowBackend.framework,
 }

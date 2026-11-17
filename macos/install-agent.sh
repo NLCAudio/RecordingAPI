@@ -3,14 +3,12 @@
 # Register the launchd agent that starts the recording API on this Mac.
 #
 # Writes ~/Library/LaunchAgents/<label>.plist and loads it, so run_server.py
-# starts every time this user logs in and is started again if it ever exits.
+# starts at every log in and is started again if it ever exits.
 #
-# It is an agent (runs at log in) rather than a daemon (runs at boot) on
-# purpose, for the same reasons the Windows task runs at log on: microphone
-# permission is granted per user and is only honoured inside that user's
-# session, and OneDrive only runs there too. Pair it with automatic log in so
-# an unattended Mac reaches a desktop by itself after a power cut — README.md
-# explains how.
+# An agent (runs at log in), not a daemon (runs at boot), for the same reasons
+# the Windows task runs at log on: microphone permission is per user and only
+# honoured in that user's session, and OneDrive only runs there. Pair it with
+# automatic log in for an unattended Mac; README.md explains how.
 #
 # Usage:
 #   macos/install-agent.sh            install (or replace) and start the agent
@@ -28,15 +26,15 @@ PYTHON="$PROJECT_DIR/.venv/bin/python"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 
-# Where to reach the server: worked out from listenHost and listenPort in
-# config.yaml, by the same code the server reads them with. RECORDING_API_URL
-# overrides it. The fallback is the address used when neither is set.
+# Where to reach the server: listenHost and listenPort from config.yaml, worked
+# out by the server's own code. RECORDING_API_URL overrides it; the fallback is
+# the default address.
 BASE_URL="${RECORDING_API_URL:-}"
 if [ -z "$BASE_URL" ]; then
     if ! BASE_URL="$(cd "$PROJECT_DIR" && "$PROJECT_DIR/.venv/bin/python" -c \
         'from config import load_config; print(load_config().local_url)' 2>/dev/null)" ||
         [ -z "$BASE_URL" ]; then
-        BASE_URL="http://127.0.0.1:8000"
+        BASE_URL="http://127.0.0.1:8080"
         echo "warning: could not read the address from config.yaml; trying $BASE_URL" >&2
     fi
 fi
@@ -153,8 +151,8 @@ echo "  ffmpeg    : $FFMPEG"
 echo "  plist     : $PLIST"
 echo
 
-# Loading the agent starts it. That only means launchd launched it, so wait
-# for it to answer rather than assume.
+# Loading the agent starts it, but that only means launchd launched it; wait
+# for it to answer.
 up=""
 for _ in $(seq 1 60); do
     if curl -fsS --max-time 3 "$BASE_URL/status" >/dev/null 2>&1; then

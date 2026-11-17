@@ -3,27 +3,24 @@ macOS capture backend (AudioQueue)
 ==================================
 
 The default on macOS. The server reads the audio device itself, through Apple's
-Audio Queue Services, and hands the audio to ffmpeg over a pipe; ffmpeg only
-encodes it.
+Audio Queue Services, and pipes the audio to ffmpeg, which only encodes it.
 
-ffmpeg is not left to read the device, as it is on Windows, because its macOS
-capture (avfoundation) loses audio. macOS hands it a 512-sample chunk every
-10.7 ms; ffmpeg keeps only the most recent one and looks for it about every
-10 ms, so a chunk is overwritten whenever it looks slightly late. Measured on a
-MacBook's built-in microphone that was a tenth of the audio, and ffmpeg has no
-option to change it. An audio queue holds seconds of audio rather than one
-chunk, so a late reader costs nothing until the whole queue is full — and if
-audio is lost after all, the queue's timestamps show it, so it is logged.
+ffmpeg is not left to read the device, as on Windows, because its macOS capture
+(avfoundation) loses audio: macOS hands it a 512-sample chunk every 10.7 ms,
+ffmpeg keeps only the latest and looks about every 10 ms, so a chunk is
+overwritten whenever it looks slightly late. That measured a tenth of the audio
+on a MacBook's microphone, and ffmpeg has no option to change it. An audio
+queue holds seconds of audio, so a late reader costs nothing until the queue is
+full; if audio is lost anyway, the queue's timestamps show it and it is logged.
 
-As with avfoundation, the Dante Virtual Soundcard is one device carrying all of
-its channels, so a channel number is a channel of that one device. The two
-channels a room asked for are picked out here, before the pipe: ffmpeg is
-handed plain stereo whatever the device's channel count.
+The Dante Virtual Soundcard is one device carrying all of its channels, so a
+channel number is a channel of that device. The room's two channels are picked
+out here, so ffmpeg is handed plain stereo whatever the channel count.
 
-The file reads top down: the backend, the capture it starts for each recording,
-then the calls into Apple's frameworks that both rest on. Nothing outside the
-standard library is used, and nothing macOS-specific is loaded until a device
-is listed or opened, so importing this file on Windows is harmless.
+The file reads top down: the backend, the capture it starts per recording, then
+the calls into Apple's frameworks. Only the standard library is used, and
+nothing macOS-specific is loaded until a device is listed or opened, so
+importing this file on Windows is harmless.
 """
 
 import array
@@ -48,27 +45,23 @@ from .base import (
     pan_to_stereo,
 )
 
-# How much audio the capture queue holds, and the least it is ever given: an
-# audioBufferMs below this is raised to it. It is the stall this server's own
-# threads can have without audio being lost. Memory is the only cost — about
-# 25 MB per recording on a 64-channel device — so a shorter queue gains nothing,
-# and a value sized for the Windows buffer must not shrink this one.
+# How much audio the capture queue holds, and the floor for audioBufferMs. It
+# is the stall this server's own threads can have without losing audio. Memory
+# is the only cost (about 25 MB per recording on a 64-channel device), and a
+# value sized for the Windows buffer must not shrink it.
 MIN_BUFFER_MS = 2000
 
-# Each buffer in the queue holds this much audio. Long enough that Python is
-# called only ten times a second, short enough that the level meter, which is
-# fed from this stream, does not visibly lag.
+# Audio per buffer in the queue: long enough that Python is called only ten
+# times a second, short enough that the level meter does not visibly lag.
 BUFFER_MS_EACH = 100
 
-# How far ffmpeg may fall behind before audio is dropped instead of kept
-# waiting for it. A stalled disk or encoder is ridden out in memory up to here.
-# Without a limit, one recording whose ffmpeg had hung for good would grow
-# until it took the server, and every other room's recording, down with it.
+# How far ffmpeg may fall behind before audio is dropped rather than kept for
+# it. A stalled disk or encoder is ridden out in memory up to here; without a
+# limit, one hung ffmpeg would grow until it took every room's recording down.
 MAX_BACKLOG_S = 30
 
-# If nothing has arrived from the device for this long, say so. A device that
-# stops delivering (Dante Virtual Soundcard being stopped, say) does not end
-# the queue or raise an error; the audio just ceases.
+# Warn after this long without audio. A device that stops delivering (Dante
+# Virtual Soundcard being stopped, say) raises no error; the audio just ceases.
 SILENT_DEVICE_WARNING_S = 5.0
 
 # How long stop() waits for the last audio to be written into ffmpeg. Only
@@ -84,8 +77,8 @@ logger = logging.getLogger("recording_api")
 @dataclasses.dataclass(frozen=True)
 class InputDevice:
     name: str
-    # The identifier that stays the same across reboots, unlike the numeric
-    # device id; it is what an audio queue is pointed at a device with.
+    # Stays the same across reboots, unlike the numeric device id; it is what
+    # an audio queue is pointed at a device with.
     uid: str
     channels: int  # how many input channels the device has
     sample_rate: float
@@ -105,9 +98,8 @@ class AudioQueueBackend(CaptureBackend):
                 )
 
         return CaptureInput(
-            # Raw PCM on stdin, in the format AudioQueueCapture writes: stereo,
-            # interleaved 32-bit floats. ffmpeg cannot detect any of that from
-            # a bare stream, so all three are stated.
+            # Raw PCM as AudioQueueCapture writes it: stereo, interleaved 32-bit
+            # floats. A bare stream does not say so, hence the three options.
             args=[
                 "-f",
                 "f32le",
@@ -122,8 +114,7 @@ class AudioQueueBackend(CaptureBackend):
             filter_prefix="[0:a]" + pan_to_stereo(0, 1),
             feeder=AudioQueueCapture(
                 device,
-                # The device's channels are counted from zero in the audio it
-                # delivers, and from one everywhere a person sees them.
+                # Channels count from zero in the audio and from one for people.
                 left=left_channel - 1,
                 right=right_channel - 1,
                 buffer_ms=max(self.config.audio_buffer_ms or 0, MIN_BUFFER_MS),
@@ -147,10 +138,10 @@ class AudioQueueBackend(CaptureBackend):
 def pick_stereo(interleaved, channels: int, left: int, right: int) -> bytes:
     """Two channels out of interleaved 32-bit float audio, as stereo.
 
-    `interleaved` is anything that exposes its memory (bytes, a ctypes array);
-    `left` and `right` are 0-based channel indexes and may be the same channel.
-    Every step runs in C, so it costs microseconds per buffer whatever the
-    channel count — which matters, because it runs on AudioQueue's own thread.
+    `interleaved` is anything exposing its memory (bytes, a ctypes array);
+    `left` and `right` are 0-based and may be the same channel. Every step runs
+    in C, costing microseconds per buffer whatever the channel count, which
+    matters because this runs on AudioQueue's own thread.
     """
     samples = memoryview(interleaved).cast("B").cast("f")
     frames = len(samples) // channels
@@ -165,12 +156,12 @@ class AudioQueueCapture:
     """One recording's capture: two channels of a device, written into ffmpeg.
 
     start() begins recording and returns. stop() ends it and waits for what is
-    left to be written; it may be called more than once and from any thread.
+    left to be written; it may be called twice, and from any thread.
 
-    The pipe into ffmpeg is closed by the thread that writes to it, whenever
-    and however that thread ends. Closing it is what tells ffmpeg the recording
-    is over and lets it finalise the file — so a capture that fails ends the
-    recording, instead of leaving one that looks alive and records nothing.
+    The pipe into ffmpeg is closed by the thread that writes to it, however
+    that thread ends. Closing it tells ffmpeg the recording is over, so a
+    capture that fails ends the recording instead of leaving one that looks
+    alive and records nothing.
     """
 
     def __init__(self, device: InputDevice, left: int, right: int, buffer_ms: int):
@@ -245,8 +236,7 @@ class AudioQueueCapture:
             "creating the audio queue",
         )
         try:
-            # Without this the queue records from whatever the system's
-            # default input happens to be.
+            # Otherwise the queue records from the system's default input.
             uid_ref = ctypes.c_void_p(
                 core_foundation.CFStringCreateWithCString(
                     None, device.uid.encode(), KCF_STRING_ENCODING_UTF8
@@ -266,17 +256,16 @@ class AudioQueueCapture:
                 core_foundation.CFRelease(uid_ref)
 
             if device.channels > 2:
-                # Beyond stereo, a queue may want to be told what the channels
-                # are. "Discrete, in order" says they are simply the device's
-                # channels as they come, which is all a Dante device's are.
-                # An AudioChannelLayout: tag, bitmap, description count.
+                # Beyond stereo a queue may want to be told what the channels
+                # are: "discrete, in order" means the device's channels as they
+                # come. An AudioChannelLayout is tag, bitmap, description count.
                 layout = struct.pack("@III", (147 << 16) | device.channels, 0, 0)
                 status = audio_toolbox.AudioQueueSetProperty(
                     self.queue_ref, fourcc("aqcl"), layout, len(layout)
                 )
                 if status != 0:
-                    # Not fatal by itself: if the queue really cannot run
-                    # without it, starting it below fails and says so.
+                    # Not fatal: if the queue cannot run without it, starting
+                    # it below fails and says so.
                     logger.info(
                         "[%s] could not set a %d-channel layout (status %s)",
                         self.label,
@@ -321,9 +310,8 @@ class AudioQueueCapture:
             frames = buffer.contents.byte_size // self.bytes_per_frame
             if frames:
                 # Each buffer says where in the device's stream it starts. If
-                # that is not where the previous one ended, the audio in
-                # between was never delivered: the queue had no free buffer
-                # left for it.
+                # that is not where the last one ended, the audio in between
+                # was never delivered: the queue had no free buffer for it.
                 start = timestamp.contents.sample_time
                 expected = self.next_sample_time
                 if expected is not None and start - expected > 1:
@@ -334,8 +322,7 @@ class AudioQueueCapture:
                 samples = (ctypes.c_float * (frames * channels)).from_address(
                     buffer.contents.data
                 )
-                # Copies the two channels out, so the buffer is free to be
-                # refilled as soon as it is handed back below.
+                # Copied out, so the buffer can be refilled once handed back.
                 self.keep(pick_stereo(samples, channels, self.left, self.right), frames)
             if not self.winding_down.is_set():
                 # Hand the buffer back to be filled again.
@@ -343,9 +330,8 @@ class AudioQueueCapture:
                     self.queue_ref, buffer, 0, None
                 )
         except Exception:
-            # Must not escape into AudioQueue's thread. Whatever went wrong
-            # would go wrong for every buffer, so end the recording where it
-            # can be seen rather than go on recording nothing.
+            # Must not escape into AudioQueue's thread. It would fail for every
+            # buffer, so end the recording visibly rather than record nothing.
             logger.exception(
                 "[%s] audio capture failed; ending the recording", self.label
             )
@@ -357,8 +343,7 @@ class AudioQueueCapture:
         try:
             self.chunks.put_nowait(chunk)
         except queue.Full:
-            # Logged when it starts and when it ends, not once per chunk: ten
-            # lines a second would bury the rest of the log.
+            # Logged when it starts and when it ends, not ten times a second.
             if self.dropped_frames == 0:
                 logger.error(
                     "[%s] ffmpeg is more than %d s behind; audio is being lost "
@@ -410,19 +395,17 @@ class AudioQueueCapture:
                 silent_for, warned_silent = 0.0, False
                 write_all(fd, chunk)
         except OSError as e:
-            # ffmpeg has gone away, and has said why on its own stderr. Not
-            # worth a line when that happened because the recording was being
-            # stopped anyway.
+            # ffmpeg has gone, and said why on its own stderr. Not worth a line
+            # if the recording was being stopped anyway.
             if not self.stopped:
                 logger.warning("[%s] ffmpeg stopped reading audio: %s", self.label, e)
         except Exception:
             logger.exception("[%s] capture writer failed", self.label)
         finally:
-            # Nothing will be written after this, so stop the queue being
-            # refilled for nobody, and let ffmpeg see the end of its input.
-            # Closed here and nowhere else: closing a pipe another thread is
-            # still writing to would free its number for the next recording's
-            # pipe, and this recording's audio would land in that one.
+            # Nothing more will be written: stop the queue being refilled and
+            # let ffmpeg see the end of its input. Closed here only: closing a
+            # pipe another thread is still writing to would free its number for
+            # the next recording's pipe, and this audio would land in that one.
             self.winding_down.set()
             try:
                 self.sink.close()
@@ -437,16 +420,16 @@ class AudioQueueCapture:
 
             audio_toolbox = frameworks().audio_toolbox
             self.winding_down.set()
-            # Synchronous: the callback runs once more for each buffer that is
-            # partly filled, so the last fraction of a second is not cut off.
+            # Synchronous: the callback runs once more for each partly filled
+            # buffer, so the last fraction of a second is not cut off.
             audio_toolbox.AudioQueueStop(self.queue_ref, True)
             self.capture_ended.set()
 
             self.writer.join(DRAIN_TIMEOUT_S)
             if self.writer.is_alive():
-                # ffmpeg is not reading. The pipe stays open, because the
-                # writer is still inside a write to it; the caller gives up on
-                # ffmpeg next, and killing it is what ends that write.
+                # ffmpeg is not reading. The pipe stays open because the writer
+                # is still inside a write to it; the caller kills ffmpeg next,
+                # which ends that write.
                 logger.warning(
                     "[%s] ffmpeg did not take the last of the audio within %.0f s",
                     self.label,
@@ -456,8 +439,7 @@ class AudioQueueCapture:
 
 
 def write_all(fd: int, data: bytes) -> None:
-    # A pipe takes less than one chunk at a time, so a single os.write would
-    # silently drop the rest.
+    # A pipe takes less than a chunk at once; one os.write would drop the rest.
     view = memoryview(data)
     while view:
         view = view[os.write(fd, view) :]
@@ -465,9 +447,8 @@ def write_all(fd: int, data: bytes) -> None:
 
 # --- Apple's frameworks -------------------------------------------------------
 #
-# Everything below is the plumbing: the C structures and calls of CoreAudio
-# (which devices exist), AudioToolbox (the audio queue) and CoreFoundation
-# (their strings), reached through ctypes.
+# The plumbing: the C structures and calls of CoreAudio (which devices exist),
+# AudioToolbox (the audio queue) and CoreFoundation (their strings), via ctypes.
 
 KCF_STRING_ENCODING_UTF8 = 0x08000100
 AUDIO_OBJECT_SYSTEM = 1  # kAudioObjectSystemObject
@@ -540,8 +521,8 @@ INPUT_CALLBACK = ctypes.CFUNCTYPE(
 class CaptureError(OSError):
     """A device could not be read, opened or started.
 
-    An OSError so that the API reports it the way it reports ffmpeg failing to
-    start: nothing the caller can fix by pressing the button again.
+    An OSError, so the API reports it like ffmpeg failing to start: nothing the
+    caller can fix by pressing the button again.
     """
 
 
@@ -555,8 +536,8 @@ class Frameworks(NamedTuple):
 def frameworks() -> Frameworks:
     """Load the three Apple frameworks and declare the calls made into them.
 
-    The declarations matter: without them ctypes passes every argument as a
-    32-bit int, which truncates the 64-bit pointers these calls take.
+    Without the declarations ctypes passes every argument as a 32-bit int,
+    truncating the 64-bit pointers these calls take.
     """
     core_audio = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
     core_foundation = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
@@ -674,8 +655,7 @@ def read_string(object_id: int, selector: str) -> str:
             )
         return text.value.decode()
     finally:
-        # Reading a string property hands over a reference that is ours to
-        # release.
+        # A string property hands over a reference that is ours to release.
         core_foundation.CFRelease(reference)
 
 
@@ -721,9 +701,8 @@ def list_input_devices() -> list[InputDevice]:
         try:
             device = describe_device(device_id)
         except CaptureError as e:
-            # A headset that was switched off while the list was being read, or
-            # a virtual device that does not answer. No reason to refuse a
-            # recording from a different device, so leave it out and say so.
+            # A headset switched off mid-listing, or a virtual device that does
+            # not answer, is no reason to refuse recording from another device.
             logger.warning("leaving out an audio device that cannot be read: %s", e)
             continue
         if device is not None:

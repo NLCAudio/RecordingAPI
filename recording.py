@@ -2,15 +2,13 @@
 Recording sessions
 ==================
 
-Owns everything about recordings that are currently running: the ffmpeg
-processes, the capture feeding them where ffmpeg does not read the device
-itself, the live audio levels read back from them, and the bookkeeping that
-keeps all of it in step.
+Everything about recordings that are running: the ffmpeg processes, the
+capture feeding them where ffmpeg does not read the device itself, their live
+audio levels, and the bookkeeping that keeps these in step.
 
-All of that state lives inside SessionRegistry, which holds the locks that
-protect it. Callers never take a lock themselves — they call a registry method
-and get a Session back, so it is not possible to read the state without
-holding the right lock.
+The state lives in SessionRegistry, which also holds the locks protecting it.
+Callers only call registry methods and get a Session back, so the state cannot
+be read without the right lock held.
 """
 
 import dataclasses
@@ -32,14 +30,12 @@ from backends import CaptureInput, get_backend
 from backends.base import AudioFeeder
 from config import Config
 
-# How often the file being recorded is forced out of the OS page cache and onto
-# the disk. -flush_packets (see build_recording_cmd) hands every MP3 frame to
-# the OS the moment it is encoded, but the OS is then free to hold it in memory
-# until its own writeback timer fires — 30s on macOS — and a power cut takes
-# whatever is still sitting there. fsync closes that window. Five seconds is
-# short enough to bound the loss to something nobody will miss and long enough
-# that the syncing itself is nothing: the data is already in the cache, so each
-# call measured well under a millisecond, including on a OneDrive folder.
+# How often the recording is forced from the OS cache onto the disk.
+# -flush_packets (see build_recording_cmd) gets each MP3 frame to the OS at
+# once, but the OS may hold it in memory until its own writeback — 30 s on
+# macOS — and a power cut takes what is still there. fsync closes that window.
+# Each call measured well under a millisecond, also on a OneDrive folder,
+# because the data is already in the cache.
 DISK_SYNC_INTERVAL_S = 5.0
 
 # Audio levels below this dB value are treated as silence / no signal.
@@ -49,42 +45,37 @@ FLOOR_LEVEL_DB = -60.0
 # "lavfi.astats.1.RMS_level=-23.4". Channel numbering starts at 1.
 LEVEL_LINE = re.compile(rb"lavfi\.astats\.(\d)\.RMS_level=(-?(\d+\.\d+|inf|nan))")
 
-# Measures the RMS level (volume) of each channel once per second and prints it
-# to stderr, where relay_ffmpeg_output() picks it up to drive the live meter.
+# Prints each channel's RMS level (volume) to stderr once a second, where
+# relay_ffmpeg_output() reads it to drive the live meter.
 LEVEL_METERING_FILTER = (
     "astats=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=none,"
     "ametadata=mode=print"
 )
 
-# Hides the console window ffmpeg would otherwise pop up on Windows. The
-# constant only exists there, so fall back to 0 (no flags) everywhere else.
+# Stops ffmpeg opening a console window on Windows. The constant only exists
+# there, hence the fallback to 0 (no flags).
 NO_WINDOW_FLAG = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # How long to wait for ffmpeg to finalise the file before force-killing it.
 STOP_TIMEOUT_S = 10
 
-# Lines ffmpeg prints only once every input and output is open and the encode
-# has begun. It prints neither if it gives up on the device, the encoder options
-# or the output file — verified against ffmpeg 8.1 for each of those failures —
-# which is what makes them proof that a recording really started rather than a
-# guess based on elapsed time. A per-second level line means the same thing and
-# more (audio has reached the encoder), so it counts too, in relay_ffmpeg_output.
-# Two spellings because one wording change in a future ffmpeg must not leave
-# every start unconfirmed.
+# Lines ffmpeg prints only once every input and output is open and encoding has
+# begun — not if it gives up on the device, the encoder options or the output
+# file (verified against ffmpeg 8.1). That makes them proof that a recording
+# really started. A level line proves the same and more, so relay_ffmpeg_output
+# counts it too. Two spellings, so that one wording change in a future ffmpeg
+# does not leave every start unconfirmed.
 #
-# Where a feeder supplies the audio, ffmpeg's input is a pipe and these lines
-# say nothing about the device. They do not need to: the feeder opens the
-# device itself before a session exists, and raises if it cannot.
+# With a feeder, ffmpeg's input is a pipe and these lines say nothing about the
+# device; the feeder opens the device itself and raises if it cannot.
 STARTED_MARKER = re.compile(rb"Press \[q\] to stop|Output #\d+,")
 
-# The backstop for an ffmpeg that neither confirms nor exits — a device that
-# hangs on open, say. Only reached when something is already wrong; a healthy
-# start confirms in well under half a second.
+# Backstop for an ffmpeg that neither confirms nor exits (a device that hangs
+# on open, say). A healthy start confirms in well under half a second.
 STARTUP_TIMEOUT_S = 5.0
 
-# Characters that cannot appear in a folder or file name on Windows. The set
-# also covers both path separators, which is what keeps a room name like
-# "../../etc" from writing outside outputPath.
+# Characters Windows does not allow in a file or folder name. Covering both
+# path separators is what keeps a room name like "../../etc" inside outputPath.
 INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 # Names Windows refuses whatever the extension, left over from DOS devices.
@@ -104,12 +95,11 @@ def format_time(seconds: int) -> str:
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
-# What one recording needs to know about itself. This doubles as the JSON body
-# callers send to the start/stop/toggle endpoints, which FastAPI validates for
-# us. Channels are numbered the way Dante Controller numbers them, from 1.
+# One recording's parameters, and the JSON body of the start/stop/toggle
+# endpoints (validated by FastAPI). Channels count from 1, as in Dante Controller.
 class RecordingRequest(BaseModel):
-    # Required: it is what a recording is found by again when it is stopped, so
-    # a request without one must be refused rather than filed under a default.
+    # Required: a recording is found again by it when stopped, so a request
+    # without one is refused rather than filed under a default.
     room_name: str
     service_name: str = "service_name"
     left_input_channel: int = 1  # which input channel maps to the left side
@@ -124,27 +114,25 @@ class Session:
     process: subprocess.Popen  # the running ffmpeg process
     started_at: float  # Unix timestamp so we can compute elapsed time
     path: str  # where the MP3 file is being written
-    # Live level per output channel, index 0 = left, 1 = right. Kept as a list
-    # so the stderr reader can write to it by channel number without branching.
+    # Live level per output channel: 0 = left, 1 = right. A list, so the stderr
+    # reader can write to it by channel number.
     levels: list[float] = dataclasses.field(
         default_factory=lambda: [FLOOR_LEVEL_DB, FLOOR_LEVEL_DB]
     )
-    # How the start turned out. All four are written by the one stderr reader
-    # thread and read by confirm_started() once the event says they are final,
-    # so they need no lock of their own.
+    # How the start turned out. Written only by the stderr reader thread and
+    # read by confirm_started() once the event is set, so no lock is needed.
     startup_settled: threading.Event = dataclasses.field(
         default_factory=threading.Event
     )
     confirmed_recording: bool = False  # ffmpeg said it is encoding
     exit_code: int | None = None  # set instead, if it exited first
     last_message: str = ""  # its last stderr line, which says why
-    # Tells sync_to_disk() to do its last fsync and let go of the file. Set once
-    # ffmpeg has exited, however it exited.
+    # Set once ffmpeg has exited, telling sync_to_disk() to do its last fsync.
     ffmpeg_finished: threading.Event = dataclasses.field(
         default_factory=threading.Event
     )
-    # What writes the audio into ffmpeg's stdin, on a backend where ffmpeg does
-    # not read the device itself (macOS). None where it does.
+    # Writes the audio into ffmpeg's stdin where ffmpeg does not read the device
+    # itself (macOS); None where it does.
     feeder: AudioFeeder | None = None
 
     @property
@@ -161,8 +149,7 @@ class Session:
         return self.levels[1]
 
     def silence_levels(self) -> None:
-        # Used when ffmpeg exits, so the meter shows silence rather than the
-        # last captured value, which would be misleading.
+        # On ffmpeg's exit: silence misleads less than the last captured level.
         self.levels = [FLOOR_LEVEL_DB] * len(self.levels)
 
     def status(self) -> dict:
@@ -179,19 +166,14 @@ class Session:
 
 
 class SessionRegistry:
-    """The set of rooms currently recording, and the locks guarding it.
+    """The rooms currently recording, and the locks guarding them.
 
-    Two locks with one job each:
-
-    - _state_lock guards the dictionary itself and is only ever held for
-      dictionary operations. It is never held across starting or stopping
-      ffmpeg, so spawning a recording in one room cannot stall the status push
-      thread reading levels for another.
-    - _room_locks serialise the slow work per room, so a start and a stop for
-      the same room cannot interleave. Without it, two toggles arriving
-      together could both decide the room was idle and both start a recording.
-      They are reentrant, so toggle() can hold one while calling start() or
-      stop(), which take the same lock.
+    - _state_lock guards the dictionary and is held only for dictionary
+      operations, never while starting or stopping ffmpeg, so one room's start
+      cannot stall the status push reading another room's levels.
+    - _room_locks serialise the slow work per room, so two toggles arriving
+      together cannot both find the room idle and both start. They are
+      reentrant, so toggle() can hold one while calling start() or stop().
     """
 
     def __init__(self):
@@ -220,27 +202,23 @@ class SessionRegistry:
             if self._live_session(room_name) is not None:
                 return None
 
-            # Deliberately outside _state_lock: this spawns a process and
-            # touches the filesystem, which is far too slow to hold up readers.
+            # Outside _state_lock on purpose: spawning a process and touching
+            # the filesystem is far too slow to hold up readers.
             session = start_ffmpeg(request, config)
 
-            # Watches ffmpeg's stderr for level data and keeps the Session
-            # updated in real time. Started before the room is registered
-            # because it is also what reports whether the start worked at all.
+            # Reads ffmpeg's stderr: keeps the levels current and reports
+            # whether the start worked, so it runs before the room is registered.
             threading.Thread(
                 target=relay_ffmpeg_output,
                 args=(self, room_name, session),
                 daemon=True,
             ).start()
 
-            # Raises if ffmpeg failed, leaving the room unregistered and idle —
-            # so a failed start is reported as one instead of leaving a session
-            # behind that never records anything.
+            # Raises if ffmpeg failed, leaving the room unregistered and idle.
             confirm_started(room_name, session)
 
-            # Only now, because this opens the recording by name and ffmpeg has
-            # just told us it has created it. Starting it alongside the reader
-            # above would race ffmpeg to the file.
+            # Only now: it opens the recording by name, and ffmpeg has just
+            # confirmed that it created it.
             threading.Thread(
                 target=sync_to_disk,
                 args=(room_name, session),
@@ -258,8 +236,7 @@ class SessionRegistry:
         with self._room_lock(room_name):
             session = self._live_session(room_name)
             if session is None:
-                # Nothing to stop, but the room may still hold a session whose
-                # ffmpeg died on its own; _live_session has just dropped it.
+                # Idle, or its ffmpeg died and _live_session has just dropped it.
                 return None
 
             stop_ffmpeg(session)
@@ -274,8 +251,7 @@ class SessionRegistry:
         """Stop the room if it is recording, start it if it is not.
 
         Returns (is_recording_now, session). The room lock is held across the
-        decision and the action, so simultaneous toggles queue up instead of
-        both seeing an idle room.
+        decision and the action, so simultaneous toggles queue up.
         """
         with self._room_lock(request.room_name):
             if self._live_session(request.room_name) is not None:
@@ -283,10 +259,9 @@ class SessionRegistry:
             return True, self.start(request, config)
 
     def stop_all(self) -> list[str]:
-        """Stop every room that is recording; returns the rooms that were.
+        """Stop every recording room, as on shutdown; returns the rooms stopped.
 
-        For when the server itself is shutting down. Stopped one by one through
-        stop(), so each MP3 is finalised exactly as it is for a stop request.
+        Goes through stop(), so each MP3 is finalised as for a stop request.
         """
         with self._state_lock:
             rooms = list(self._sessions)
@@ -328,14 +303,12 @@ def build_recording_cmd(
     capture_input: CaptureInput,
     output_path: str,
 ) -> list[str]:
-    # Builds the list of arguments we pass to ffmpeg to start a recording.
-    # The backend supplies the inputs and the filter that turns them into a
-    # stereo stream; everything here is the same on every platform.
+    # The ffmpeg command for one recording. The backend supplies the inputs and
+    # the filter that makes them stereo; the rest is the same on every platform.
     return [
         "ffmpeg",
         "-hide_banner",  # suppress the ffmpeg version/copyright header
-        # Suppress the size=/time= progress ticker, which would otherwise
-        # clutter the log (it is written with \r, not newlines).
+        # No size=/time= progress ticker: written with \r, it clutters the log.
         "-nostats",
         *capture_input.args,  # -f <format> ... -i <source>, one set per input
         "-filter_complex",
@@ -346,14 +319,12 @@ def build_recording_cmd(
         "libmp3lame",  # encode as MP3
         "-b:a",
         config.bitrate,
-        # Write each MP3 frame to the file as it is encoded, instead of letting
-        # ffmpeg fill its 256KB output buffer first. Without this a recording
-        # killed by a power cut loses everything still in that buffer, which at
-        # 128k is up to sixteen seconds — and, because the buffer only starts
-        # filling once the file is opened, a recording shorter than the first
-        # 256KB leaves a file of zero bytes. Measured, not assumed: ten seconds
-        # then SIGKILL gives an empty file without the flag and a complete one
-        # with it. The cost is one small write per frame, about 38 a second.
+        # Write each MP3 frame as it is encoded instead of filling ffmpeg's
+        # 256KB output buffer first. Without it a power cut loses what is in
+        # that buffer: up to sixteen seconds at 128k, and the whole file if the
+        # recording is shorter than that. Measured: ten seconds then SIGKILL
+        # leaves an empty file without the flag and a complete one with it.
+        # The cost is about 38 small writes a second.
         "-flush_packets",
         "1",
         output_path,
@@ -363,10 +334,8 @@ def build_recording_cmd(
 def free_path(path: Path) -> Path:
     """The given path, or the first numbered variant of it that is free.
 
-    The timestamp in a recording's name only goes down to the second, so two
-    recordings of the same room started within the same second would collide.
-    ffmpeg refuses to overwrite an existing file, so without this the second
-    recording would fail and be lost.
+    Names are timestamped to the second, so two recordings of one room started
+    within the same second would collide, and ffmpeg refuses to overwrite.
     """
     candidate = path
     attempt = 2
@@ -379,23 +348,19 @@ def free_path(path: Path) -> Path:
 def safe_name(raw: str, fallback: str) -> str:
     """`raw` reduced to something every filesystem accepts as one folder name.
 
-    Room and service names arrive in the request body, so they are whatever the
-    Companion button was configured with — and they are about to become folder
+    Room and service names come from the Companion button and become folder
     names. Anything unusable is replaced rather than rejected: an odd-looking
-    folder is a much better outcome mid-service than a button press that
-    records nothing.
+    folder beats a button press that records nothing.
     """
     name = INVALID_NAME_CHARS.sub("_", raw)
-    # Windows silently drops trailing dots and spaces, so a service named "9am."
-    # would not end up in the folder we think we created. Stripping leading ones
-    # too also disposes of "." and "..", which contain no invalid character but
-    # would otherwise walk up out of outputPath.
+    # Windows drops trailing dots and spaces, so "9am." would not land in the
+    # folder we created. Stripping leading ones too removes "." and "..", which
+    # would otherwise climb out of outputPath.
     name = name.strip(" .")
     if not name:
         return fallback
     if name.upper() in RESERVED_NAMES:
-        # Prefixed rather than replaced, so a room genuinely called "AUX" is
-        # still recognisable in the folder listing.
+        # Prefixed, not replaced, so a room called "AUX" stays recognisable.
         return f"_{name}"
     return name
 
@@ -403,9 +368,8 @@ def safe_name(raw: str, fallback: str) -> str:
 def prepare_output_path(config: Config, request: RecordingRequest) -> str:
     """Create <outputPath>/<room>/<service>/ and return the file to record into.
 
-    Grouping recordings by room and then by service is what keeps a season of
-    services findable; the room, service and timestamp stay in the filename as
-    well, so a file that is copied out of here still says what it is.
+    The room, service and timestamp are in the filename too, so a file copied
+    out of its folder still says what it is.
     """
     room = safe_name(request.room_name, fallback="room")
     service = safe_name(request.service_name, fallback="service")
@@ -426,13 +390,11 @@ def prepare_output_path(config: Config, request: RecordingRequest) -> str:
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        # Re-raised with the full path: the operator needs to know which folder
-        # could not be made, and "Permission denied" alone does not say.
+        # Re-raised with the path: "Permission denied" alone does not say where.
         raise OSError(f"could not create recording folder {directory}: {e}") from e
 
-    # mkdir succeeding on a folder that already exists says nothing about being
-    # able to write into it — a read-only OneDrive folder gets caught here
-    # rather than as an ffmpeg error a second later.
+    # mkdir succeeding on an existing folder says nothing about writing into
+    # it; this catches a read-only OneDrive folder before ffmpeg fails on it.
     if not os.access(directory, os.W_OK):
         raise OSError(f"recording folder {directory} is not writable")
 
@@ -446,19 +408,14 @@ def prepare_output_path(config: Config, request: RecordingRequest) -> str:
 def confirm_started(room_name: str, session: Session) -> None:
     """Wait until ffmpeg is known to be recording, or known to have failed.
 
-    Popen returns as soon as the process is *spawned*, so an ffmpeg that refuses
-    the device or cannot open the output file still looks like a successful
-    start: the button lights up green and the service goes unrecorded. So rather
-    than assume, wait for ffmpeg to say which of the two happened — the stderr
-    reader is already watching for exactly that and sets the event either way.
-
-    A healthy start settles this in around a third of a second, and a failing
-    one usually faster, so the wait costs nothing that is not worth knowing.
+    Popen returns once the process is spawned, so an ffmpeg that refuses the
+    device or the output file would still look like a successful start: a green
+    button and an unrecorded service. The stderr reader sets the event either
+    way, for a healthy start in about a third of a second.
     """
     if not session.startup_settled.wait(STARTUP_TIMEOUT_S):
-        # Neither confirmed nor exited. Reporting a failure here would be its
-        # own kind of lie — ffmpeg may well be recording — so let it run and
-        # leave a line explaining why the button took so long to answer.
+        # Neither confirmed nor exited. ffmpeg may well be recording, so let it
+        # run and log why the button took so long to answer.
         logger.warning(
             "[%s] ffmpeg has not confirmed it is recording after %.0fs; treating "
             "it as running -> %s",
@@ -471,9 +428,8 @@ def confirm_started(room_name: str, session: Session) -> None:
     if session.confirmed_recording:
         return
 
-    # The event was set by the reader thread reaching end of output, which it
-    # only does once ffmpeg has exited and been reaped — so exit_code and
-    # last_message are both final by now.
+    # The reader sets the event at end of output, once ffmpeg has been reaped,
+    # so exit_code and last_message are final by now.
     raise OSError(
         f"ffmpeg exited with code {session.exit_code} without recording "
         f"{session.path}: {session.last_message or 'no output from ffmpeg'}"
@@ -481,24 +437,21 @@ def confirm_started(room_name: str, session: Session) -> None:
 
 
 def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
-    # Ask the platform's backend where ffmpeg gets the requested channels from.
-    # Resolved per recording because devices come and go (Dante Virtual
-    # Soundcard restarting, for instance).
+    # Where ffmpeg gets the requested channels from. Resolved per recording
+    # because devices come and go (Dante Virtual Soundcard restarting, say).
     capture_input = get_backend(config).capture_input(
         request.left_input_channel, request.right_input_channel
     )
 
     out_path = prepare_output_path(config, request)
 
-    # stdin=PIPE lets us send "q" to stop ffmpeg gracefully later — or, with a
-    # feeder, is where the audio itself goes in.
-    # stderr=PIPE lets relay_ffmpeg_output consume the level output.
+    # stdin is for sending "q" to stop ffmpeg or, with a feeder, for the audio
+    # itself; stderr is read by relay_ffmpeg_output for the levels.
     process = subprocess.Popen(
         build_recording_cmd(config, capture_input, out_path),
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        # Keeps Windows from opening a console window for every recording.
         creationflags=NO_WINDOW_FLAG,
     )
 
@@ -506,10 +459,8 @@ def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
         try:
             capture_input.feeder.start(process.stdin, request.room_name)
         except OSError:
-            # The device would not open. ffmpeg is already running and would
-            # wait for audio forever, so take it down before reporting why —
-            # and take the file it has just created with it, which holds no
-            # audio and would otherwise sit there looking like a recording.
+            # The device would not open. Take down the ffmpeg that would wait
+            # for audio forever, and the empty file it has just created.
             process.kill()
             process.wait()
             close_pipes(process)
@@ -530,8 +481,7 @@ def stop_ffmpeg(session: Session) -> None:
 
     if session.feeder is not None:
         # stdin carries the audio here, so there is no "q" to send. Ending the
-        # capture closes the pipe instead, and ffmpeg finalises the MP3 when
-        # its input ends, just as it does for "q".
+        # capture closes the pipe, and ffmpeg finalises when its input ends.
         session.feeder.stop()
     else:
         send_quit(process)
@@ -544,11 +494,10 @@ def stop_ffmpeg(session: Session) -> None:
 
 
 def close_pipes(process: subprocess.Popen) -> None:
-    """Let go of our ends of the pipes to an ffmpeg that has exited.
+    """Close our ends of the pipes to an ffmpeg that has exited.
 
-    Python would close them eventually, when the session is forgotten and
-    collected. Doing it here means a server that records for months holds no
-    more open pipes than it has recordings running.
+    Python would do it eventually, when the session is collected; doing it now
+    keeps a long-running server from holding the pipes of finished recordings.
     """
     for pipe in (process.stdin, process.stderr):
         try:
@@ -558,17 +507,15 @@ def close_pipes(process: subprocess.Popen) -> None:
 
 
 def send_quit(process: subprocess.Popen) -> None:
-    # Ask ffmpeg to stop by sending the "q" key over its stdin, which lets it
-    # finalise the MP3 properly (write headers, flush buffers).
+    # "q" over stdin makes ffmpeg stop and finalise the MP3 properly.
     try:
         process.stdin.write(b"q")
         process.stdin.flush()
     except (BrokenPipeError, OSError, ValueError):
-        # stdin is already closed, by ffmpeg (an OSError) or by us because it
-        # had just exited (a ValueError) — fall back to a signal instead. Windows
-        # cannot deliver SIGINT to another process (send_signal rejects it),
-        # so there we can only terminate, which loses the last buffered
-        # fraction of a second rather than finalising the file cleanly.
+        # stdin is already closed, by ffmpeg (OSError) or by us once it exited
+        # (ValueError), so fall back to a signal. Windows cannot deliver SIGINT
+        # to another process; terminating instead loses the last buffered
+        # fraction of a second.
         if sys.platform == "win32":
             process.terminate()
         else:
@@ -578,20 +525,17 @@ def send_quit(process: subprocess.Popen) -> None:
 def sync_to_disk(room_name: str, session: Session) -> None:
     """Force the recording onto the disk every few seconds until ffmpeg is done.
 
-    Runs in its own thread for each active recording. ffmpeg has no option for
-    this — it writes and lets the OS decide when those bytes reach the disk —
-    so the flush has to come from outside the process.
+    One thread per recording. ffmpeg has no option for this, so the flush has
+    to come from outside the process.
 
-    The file is opened read-only on purpose. fsync flushes a file's dirty pages
-    whichever way the handle was opened, and a read-only one cannot truncate,
-    move or otherwise disturb the file ffmpeg is in the middle of writing.
+    The file is opened read-only on purpose: fsync flushes its dirty pages
+    either way, and a read-only handle cannot disturb what ffmpeg is writing.
     """
     try:
         fd = os.open(session.path, os.O_RDONLY)
     except OSError as e:
-        # Not worth failing the recording over: ffmpeg is already recording, and
-        # -flush_packets has the data as far as the OS either way. Only the last
-        # few seconds of an unexpected power cut are at stake.
+        # Not worth failing the recording over: -flush_packets gets the data to
+        # the OS anyway; only the last seconds before a power cut are at stake.
         logger.warning(
             "[%s] cannot open %s to flush it to disk; recording continues "
             "unsynced: %s",
@@ -607,9 +551,8 @@ def sync_to_disk(room_name: str, session: Session) -> None:
             try:
                 os.fsync(fd)
             except OSError as e:
-                # Windows cannot flush through a read-only handle, so rather
-                # than log this once a tick for the length of a service, say it
-                # plainly and leave the rest to -flush_packets.
+                # Windows cannot flush through a read-only handle. Say it once,
+                # not every tick, and leave the rest to -flush_packets.
                 logger.warning(
                     "[%s] cannot flush %s to disk; recording continues unsynced: %s",
                     room_name,
@@ -617,9 +560,8 @@ def sync_to_disk(room_name: str, session: Session) -> None:
                     e,
                 )
                 return
-            # Checked after the fsync, not instead of it: the event is set once
-            # ffmpeg has exited and been reaped, so this last pass is what gets
-            # the end of a finished recording onto the disk.
+            # After the fsync, not instead of it: this last pass gets the end
+            # of a finished recording onto the disk.
             if finished:
                 return
     finally:
@@ -628,7 +570,7 @@ def sync_to_disk(room_name: str, session: Session) -> None:
 
 def parse_db(raw_db: bytes) -> float:
     # ffmpeg reports "inf" or "nan" for silence and invalid input; clamp those
-    # to the floor so consumers always get a sensible number.
+    # to the floor so consumers always get a number.
     try:
         db_value = float(raw_db.decode())
     except ValueError:
@@ -639,10 +581,8 @@ def parse_db(raw_db: bytes) -> float:
 def relay_ffmpeg_output(
     registry: SessionRegistry, room_name: str, session: Session
 ) -> None:
-    # Runs in its own thread for each active recording, reading ffmpeg's stderr
-    # line by line. Level lines update the session's meter; everything else is
-    # written to the log, which is where dropped packets and buffer overruns
-    # show up.
+    # One thread per recording, reading ffmpeg's stderr. Level lines update the
+    # meter; everything else, ffmpeg's warnings included, goes to the log.
     process = session.process
     try:
         while True:
@@ -652,9 +592,8 @@ def relay_ffmpeg_output(
 
             match = LEVEL_LINE.search(line)
 
-            # A level line means audio has already reached the encoder, and the
-            # markers mean ffmpeg opened everything and began; either settles
-            # the question confirm_started() is waiting on.
+            # A level line or a start marker settles what confirm_started()
+            # is waiting on.
             if not session.startup_settled.is_set() and (
                 match is not None or STARTED_MARKER.search(line)
             ):
@@ -662,12 +601,10 @@ def relay_ffmpeg_output(
                 session.startup_settled.set()
 
             if match is None:
-                # The "ametadata" check skips the frame/pts header lines that
-                # accompany every per-second level print.
+                # "ametadata" lines are the frame/pts headers of each level print.
                 if b"ametadata" not in line:
                     message = line.decode(errors="replace").rstrip()
-                    # Kept so a start that fails can report the reason, which
-                    # ffmpeg puts in the last thing it says before exiting.
+                    # Kept for a failed start: ffmpeg says why in its last line.
                     session.last_message = message
                     logger.info("[%s] ffmpeg: %s", room_name, message)
                 continue
@@ -676,35 +613,30 @@ def relay_ffmpeg_output(
             channel = int(match.group(1)) - 1
             registry.set_level(room_name, session, channel, parse_db(match.group(2)))
     except Exception:
-        # Nothing else can report this: an exception raised in a thread is
-        # printed to stderr, which is thrown away under pythonw.exe.
+        # Nothing else reports this: under pythonw.exe a thread's traceback
+        # goes to a stderr that is thrown away.
         logger.exception("[%s] level reader failed", room_name)
     finally:
-        # wait() rather than poll(): stderr reaching EOF only means ffmpeg
-        # closed the pipe, and poll() returns None until the process is
-        # actually reaped, so the exit code would not be known yet.
+        # wait(), not poll(): end of stderr only means the pipe closed, and the
+        # exit code is not known until the process is reaped.
         code = process.wait()
         session.exit_code = code
-        # Set once the exit code and the reason are final, and before anything
-        # below that could take time: a start still waiting on this has to
-        # learn that ffmpeg is gone within its own timeout. Does nothing if the
-        # recording ran normally and confirmed itself long ago.
+        # Set once the exit code and reason are final, and before anything slow
+        # below, so a start still waiting learns in time that ffmpeg is gone.
         session.startup_settled.set()
-        # ffmpeg has written the last of the file and gone, so release the disk
-        # syncer to make its final pass over it.
+        # Lets the disk syncer make its final pass over the finished file.
         session.ffmpeg_finished.set()
-        # A non-zero exit means ffmpeg gave up — the file is likely truncated
-        # or missing, so it belongs at a level the log can be filtered for.
+        # Non-zero means ffmpeg gave up and the file is likely truncated or
+        # missing, so log it at a level that can be filtered for.
         log = logger.info if code == 0 else logger.error
         log("[%s] ffmpeg exited with code %s", room_name, code)
         registry.silence_levels(room_name, session)
         if session.feeder is None:
             close_pipes(process)
         else:
-            # If ffmpeg ended by itself there is nobody left to record for; let
-            # go of the device. Does nothing after a normal stop, which already
-            # has. The pipe into ffmpeg is the feeder's to close: it may still
-            # be in the middle of a write to it.
+            # If ffmpeg ended by itself, let go of the device (a no-op after a
+            # normal stop). The pipe into ffmpeg is the feeder's to close: it
+            # may still be in the middle of a write to it.
             try:
                 session.feeder.stop()
             except Exception:

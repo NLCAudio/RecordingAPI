@@ -3,25 +3,22 @@ Windows capture backend (dshow)
 ===============================
 
 Windows does not expose the Dante Virtual Soundcard as one multi-channel
-device. Each stereo pair is a separate audio device, and ffmpeg addresses them
-by name rather than by number:
+device. Each stereo pair is its own audio device, addressed by name:
 
     [in#0 @ ...] "DVS Receive  9-10 (Dante Virtual Soundcard)" (audio)
     [in#0 @ ...]   Alternative name "@device_cm_{33D9A762-...}\wave_{1050...}"
 
-So a channel number here selects both a device and a channel inside it:
-channel 9 is channel 0 of the "9-10" device, channel 10 is channel 1 of it.
+So a channel number selects a device and a channel inside it: channel 9 is
+channel 0 of the "9-10" device, channel 10 is channel 1 of it.
 
-The channel range is read out of the device name itself rather than being
-built from a template, because the names are padded to line the numbers up
-("DVS Receive  9-10" has two spaces, "DVS Receive 15-16" has one) and exact
-string matching would silently miss half of them.
+The channel range is read from the device name itself, not built from a
+template: the names are padded to line the numbers up ("DVS Receive  9-10" has
+two spaces, "DVS Receive 15-16" one), so exact matching would miss half of them.
 
-If the left and right channel land in different pairs, both devices are opened
-and amerge glues them into one stream before the pan. That means two capture
-clocks feeding one filter, so both inputs get a deep packet queue, and
-audioBufferMs in config.yaml is the knob to reach for if that turns out to
-drop audio in practice.
+If left and right land in different pairs, both devices are opened and amerge
+joins them into one stream before the pan. That is two capture clocks feeding
+one filter, so both inputs get a deep packet queue, and audioBufferMs is the
+setting to raise if it drops audio in practice.
 """
 
 import dataclasses
@@ -66,10 +63,9 @@ class DShowBackend(CaptureBackend):
             merge = ""
             left_index, right_index = left.channel, right.channel
         else:
-            # pan can only read from a single stream, so amerge has to lay the
-            # two inputs out end to end first: the left device's channels, then
-            # the right device's. That shifts the right channel up by the width
-            # of the left device.
+            # pan reads from one stream, so amerge first lays the two inputs
+            # end to end: the left device's channels, then the right device's.
+            # That shifts the right channel up by the width of the left device.
             devices = [left.device, right.device]
             merge = "amerge=inputs=2,"
             left_index = left.channel
@@ -97,10 +93,9 @@ class DShowBackend(CaptureBackend):
         return channels[channel]
 
     def extra_input_args(self) -> list[str]:
-        # How much audio dshow buffers before handing it to ffmpeg, in
-        # milliseconds. Left at the device default unless config.yaml sets it;
-        # raising it trades latency (which does not matter for a recording)
-        # for resilience against dropouts.
+        # Milliseconds of audio dshow buffers before handing it to ffmpeg; the
+        # device default unless config.yaml sets it. Raising it trades latency,
+        # which does not matter for a recording, for resilience to dropouts.
         buffer_ms = self.config.audio_buffer_ms
         return ["-audio_buffer_size", str(buffer_ms)] if buffer_ms else []
 
@@ -118,17 +113,16 @@ class DShowBackend(CaptureBackend):
 
             match = CHANNEL_RANGE.search(name)
             if match is None:
-                # A matching device whose name carries no channel range tells
-                # us nothing about which channels it holds, so skip it.
+                # A matching device with no channel range in its name does not
+                # say which channels it holds, so skip it.
                 continue
 
             first, last = int(match.group(1)), int(match.group(2))
             for index, channel in enumerate(range(first, last + 1)):
                 channels[channel] = ChannelSource(
-                    # The alternative name is a device path rather than a
-                    # label: it survives the sound card being renamed and does
-                    # not depend on the padding in the friendly name, so prefer
-                    # it whenever ffmpeg gave us one.
+                    # The alternative name is a device path, not a label: it
+                    # survives the sound card being renamed and does not depend
+                    # on the padding, so prefer it when ffmpeg gives one.
                     device=alternative_name or name,
                     channel=index,
                     device_channels=last - first + 1,

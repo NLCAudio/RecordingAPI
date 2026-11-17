@@ -6,11 +6,10 @@
     Stops anything that is recording, stops the server, starts it again, and
     waits until it answers.
 
-    Recordings are stopped through the API rather than by killing ffmpeg, so
-    each MP3 is finalised with an accurate duration header. Anything still
-    running after that is killed as a process tree: ffmpeg is a child of the
-    server, and an orphaned ffmpeg holds the Dante device open, which makes the
-    next recording fail to start.
+    Recordings are stopped through the API, not by killing ffmpeg, so each MP3
+    is finalised with an accurate duration header. What is still running after
+    that is killed as a process tree: an orphaned ffmpeg holds the Dante device
+    open, and the next recording then fails to start.
 
 .PARAMETER TaskName
     The scheduled task registered by install-task.ps1. If no task by that name
@@ -42,9 +41,9 @@ $ErrorActionPreference = 'Stop'
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $Launcher = Join-Path $ProjectDir 'run_server.py'
 
-# Where to reach the server: worked out from listenHost and listenPort in
-# config.yaml, by the same code the server reads them with, unless -BaseUrl
-# was given. python.exe rather than pythonw.exe, which has no output to read.
+# Where to reach the server: listenHost and listenPort from config.yaml, worked
+# out by the server's own code, unless -BaseUrl was given. python.exe, not
+# pythonw.exe, which has no output to read.
 $RunningUrl = $BaseUrl
 if (-not $BaseUrl) {
     $python = Join-Path $ProjectDir '.venv\Scripts\python.exe'
@@ -68,14 +67,13 @@ if (-not $BaseUrl) {
     }
     else {
         # The address used when config.yaml sets neither value.
-        $BaseUrl = 'http://127.0.0.1:8000'
+        $BaseUrl = 'http://127.0.0.1:8080'
         Write-Warning "Could not read the address from config.yaml; trying $BaseUrl"
     }
 
-    # The server that is running now may not be at that address: if listenHost
-    # or listenPort was edited since it started, it is still where it was. It
-    # wrote that down when it started, so ask it there -- and wait for the new
-    # one, at the end, at the address from config.yaml.
+    # The running server may be elsewhere: if listenHost or listenPort was
+    # edited after it started, it is still at the address it noted then. Ask it
+    # there, and wait for the new one at the address from config.yaml.
     $RunningUrl = $BaseUrl
     $urlFile = Join-Path $ProjectDir 'server.url'
     if (Test-Path -LiteralPath $urlFile) {
@@ -86,8 +84,7 @@ if (-not $BaseUrl) {
 
 # --- 1. Ask the running server what it is doing -------------------------------
 
-# A server that is not running is not an error here: restarting one that is
-# already down is just starting it.
+# No answer is not an error: restarting a server that is down just starts it.
 $status = $null
 try {
     $status = Invoke-RestMethod -Uri "$RunningUrl/status" -TimeoutSec 5
@@ -98,10 +95,9 @@ catch {
 
 $rooms = @()
 if ($null -ne $status -and $null -ne $status.sessions) {
-    # Filtered to NoteProperty, and not the shorter ".Properties.Name", because
-    # on an idle server "sessions" is {} and reading .Name straight off the
-    # empty property collection yields a single $null rather than nothing --
-    # which reads as one room recording and asks to stop a room called null.
+    # Filtered to NoteProperty rather than ".Properties.Name": on an idle
+    # server "sessions" is {}, and .Name on the empty collection yields a
+    # single $null, which reads as one room recording, called null.
     $rooms = @($status.sessions.PSObject.Properties |
             Where-Object { $_.MemberType -eq 'NoteProperty' } |
             Select-Object -ExpandProperty Name)
@@ -127,8 +123,8 @@ if ($rooms.Count -gt 0) {
             Write-Host "  saved $($result.file)"
         }
         catch {
-            # Worth continuing: the restart is still wanted, and the flush
-            # settings mean a killed recording is left playable regardless.
+            # Worth continuing: the restart is still wanted, and a killed
+            # recording stays playable.
             Write-Warning "  could not stop $room cleanly: $($_.Exception.Message)"
         }
     }
@@ -176,8 +172,8 @@ else {
 
 # --- 5. Wait until it actually answers ----------------------------------------
 
-# Starting the task only means Windows launched it. A syntax error in the code
-# just changed would still exit immediately, so confirm rather than assume.
+# Starting the task only means Windows launched it. A syntax error in the
+# changed code would still exit at once, so confirm rather than assume.
 $deadline = (Get-Date).AddSeconds(30)
 $up = $false
 while ((Get-Date) -lt $deadline) {

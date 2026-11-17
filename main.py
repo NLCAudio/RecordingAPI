@@ -2,34 +2,29 @@
 Recording API
 =============
 
-This is a small web server that controls audio recording on this machine.
-Other software (like Bitfocus Companion running on a control surface) talks
-to it by sending HTTP requests — the same kind of requests a web browser
-makes. There are three main actions:
+A small web server that controls audio recording on this machine. Other
+software, such as Bitfocus Companion on a control surface, drives it with HTTP
+requests:
 
   POST /recording/start  — begin recording a room
   POST /recording/stop   — stop recording a room
   POST /recording/toggle — start if stopped, stop if running
+  GET  /status           — what is recording right now
 
-The server uses ffmpeg (a free command-line audio/video tool) to do the
-actual recording and encodes the result as an MP3 file. Recordings are filed
-under a folder per room, and a folder per service inside that. While recording
-it also reads the live audio level (in dB) so dashboards can display a meter.
+ffmpeg encodes each recording as an MP3, filed under a folder per room and per
+service. The live audio level of each recording is read back for a meter, and
+the status is pushed continuously to a Companion custom variable, so button
+panels show what is happening without polling.
 
-A background task per configured address runs continuously in its own thread
-and pushes the current status to a Bitfocus Companion "custom variable" so the
-button panels always show what is happening without needing to poll.
-
-Configuration (audio device, output folder, companion URL, etc.) lives in
-config.yaml next to this file, so you don't need to touch the code to
-change those settings.
+Settings (audio device, output folder, Companion address, ...) live in
+config.yaml next to this file.
 
 This file holds only the HTTP layer. The work behind it lives in:
 
   config.py     — what config.yaml may contain
   recording.py  — recording sessions and the ffmpeg processes behind them
   companion.py  — the status push loop
-  backends/     — how each operating system exposes audio devices to ffmpeg
+  backends/     — how the audio device is read on each operating system
 """
 
 import ipaddress
@@ -53,25 +48,22 @@ from companion import start_status_push, variable_name
 from config import DEFAULT_LOG_PATH, Config, load_config
 from recording import RecordingRequest, SessionRegistry
 
-# Application log. Everything ffmpeg prints on stderr — except the per-second
-# dB level lines, which would flood the file — ends up here, along with
-# recording start/stop events and every request that failed. This is the place
-# to look for capture problems: ffmpeg reports dropped packets and buffer
-# overruns as stderr warnings.
+# The application log: recording starts and stops, every request that failed,
+# and everything ffmpeg prints on stderr except the level lines, which would
+# flood it. The place to look when a recording went wrong.
 logger = logging.getLogger("recording_api")
 
-# Every room that is currently recording. Owns its own locking, so nothing
-# here has to coordinate between the request threads and the push thread.
+# Every room that is currently recording. It does its own locking, so the
+# request threads and the push threads need no coordination here.
 registry = SessionRegistry()
 
-# The config the server started with, None until it has. Who may use the API is
-# decided by the acceptRequestsFrom list in here — not by whatever config.yaml
-# says by the time a request arrives — so it cannot change under a running
-# service by accident.
+# The config the server started with (None until then). Access is decided by
+# its acceptRequestsFrom list, not by whatever config.yaml says when a request
+# arrives, so the list cannot change under a running service by accident.
 startup_config: Config | None = None
 
-# How often a refused address is written to the log. A machine that is not on
-# the list and retries many times a second would otherwise bury everything else.
+# How often a refused address is logged. A machine retrying many times a second
+# would otherwise bury everything else.
 REFUSAL_LOG_INTERVAL_S = 60.0
 
 # When each refused address was last logged.
@@ -79,19 +71,19 @@ refusals_logged_at: dict[str, float] = {}
 
 
 def setup_logging(log_path: Path) -> None:
-    # Rotate at 5 MB and keep 3 old files so the log can't grow without bound
-    # on a machine that records every week and is rarely looked at.
+    # Rotate at 5 MB, keeping 3 old files, so the log cannot grow without bound
+    # on a machine that is rarely looked at.
     handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=3)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    # Calling this twice (a reload, or a failed start-up retried) would
-    # otherwise write every line to the file once per handler.
+    # A second call (a reload, or a retried start-up) would otherwise write
+    # every line once per handler.
     for existing in list(logger.handlers):
         logger.removeHandler(existing)
         existing.close()
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     # run_server.py gives the root logger a handler on server.log; without this
-    # every line below would be written to both files.
+    # every line would go to both files.
     logger.propagate = False
 
 
@@ -100,9 +92,8 @@ async def lifespan(app: FastAPI):
     try:
         config = load_config()
     except Exception:
-        # A broken config.yaml means we don't know where the log belongs, and
-        # the operator would otherwise see a server that simply never came up.
-        # The default path is the one config.py would have used anyway.
+        # A broken config.yaml does not say where the log belongs, so use the
+        # default path; otherwise the server would just never come up, silently.
         setup_logging(DEFAULT_LOG_PATH)
         logger.exception("startup failed: could not read config.yaml")
         raise
@@ -123,8 +114,7 @@ async def lifespan(app: FastAPI):
             config.listen_host,
             config.listen_port,
         )
-    # When the server starts up, launch one status-push loop per configured
-    # Companion address in the background.
+    # One status-push loop per configured Companion address, in the background.
     start_status_push(registry, config)
     logger.info(
         "Audio level push started to companion at %s as custom variable %s",
@@ -132,9 +122,8 @@ async def lifespan(app: FastAPI):
         variable_name(config.server_name),
     )
     yield
-    # The server is being shut down: the machine is restarting, or someone is
-    # logging out. Stop what is recording so each MP3 is finalised properly,
-    # rather than cut off wherever ffmpeg happened to be.
+    # Shutting down (the machine is restarting, or someone is logging out):
+    # stop what is recording so each MP3 is finalised rather than cut off.
     stopped = registry.stop_all()
     if stopped:
         logger.info("server shutting down; stopped recording in %s", ", ".join(stopped))
@@ -158,8 +147,7 @@ async def refuse_unlisted_addresses(request: Request, call_next):
     """Turn away requests from addresses not listed under acceptRequestsFrom.
 
     The one place access is decided: for every endpoint, and the same way on
-    macOS and Windows, so nothing depends on how each machine's firewall
-    happens to be set up.
+    macOS and Windows, independent of either machine's firewall.
     """
     client = request.client.host if request.client else None
     server = request.scope.get("server")
@@ -183,8 +171,8 @@ def log_refusal(client: str | None, request: Request) -> None:
         return
 
     if len(refusals_logged_at) >= 1000:
-        # Only reachable if the server is exposed to far more machines than it
-        # should be; keeps this from growing for as long as it runs.
+        # Only reachable if far more machines can reach the server than should;
+        # keeps this from growing for as long as it runs.
         refusals_logged_at.clear()
     refusals_logged_at[address] = now
     logger.warning(
@@ -200,10 +188,9 @@ def log_refusal(client: str | None, request: Request) -> None:
 class LoggedHTTPException(HTTPException):
     """An HTTP error that has already been written to the log.
 
-    log_http_exception() below is the safety net that logs every HTTP error
-    response. The failures http_errors() recognises are logged there instead,
-    with the room name and a severity the safety net cannot reconstruct — so
-    they carry this type to keep it from logging them a second time.
+    http_errors() logs the failures it recognises itself, with the room name
+    and a severity; this type keeps log_http_exception(), which logs every
+    other HTTP error, from logging them a second time.
     """
 
 
@@ -211,32 +198,30 @@ class LoggedHTTPException(HTTPException):
 def http_errors(room_name: str):
     """Translate the failures a recording can have into HTTP responses.
 
-    Every branch logs before raising: an HTTPException on its own only reaches
-    the caller, and the caller is a Companion button that shows nothing more
-    than a failed press.
+    Every branch logs before raising: the caller is a Companion button, which
+    shows nothing more than a failed press.
     """
     try:
         yield
     except (DeviceNotFoundError, ChannelNotAvailableError) as e:
-        # The device or channel the caller asked for isn't there — the request
-        # is wrong, or Dante Virtual Soundcard isn't running.
+        # The device or channel asked for is not there: the request is wrong,
+        # or Dante Virtual Soundcard is not running.
         logger.warning("[%s] 422 %s", room_name, e.message)
         raise LoggedHTTPException(status_code=422, detail=e.message)
     except OSError as e:
-        # Most likely ffmpeg is not installed or the output folder is not
-        # writable. Either way the caller cannot fix it by retrying, so this is
-        # an error rather than a warning: someone has to go and fix the machine.
+        # Most likely ffmpeg is missing or the output folder is not writable.
+        # Retrying will not help; someone has to fix the machine, hence an error.
         logger.error("[%s] 400 %s", room_name, e)
         raise LoggedHTTPException(status_code=400, detail=str(e))
 
 
 @app.exception_handler(StarletteHTTPException)
 async def log_http_exception(request: Request, exc: StarletteHTTPException):
-    """Log every HTTP error response, including ones we didn't raise ourselves.
+    """Log every HTTP error response, including ones we did not raise.
 
-    Covers 404s from a mistyped URL and 405s from the wrong method — the shape
-    a misconfigured Companion button takes — which never pass through
-    http_errors() and would otherwise leave no trace in this log at all.
+    Covers the 404s and 405s of a misconfigured Companion button (a mistyped
+    URL, the wrong method), which never pass through http_errors() and would
+    otherwise leave no trace in this log.
     """
     if not isinstance(exc, LoggedHTTPException):
         logger.warning(
@@ -265,9 +250,8 @@ async def log_validation_error(request: Request, exc: RequestValidationError):
 async def log_unhandled_exception(request: Request, exc: Exception):
     """Log anything that got all the way out of a handler, with a traceback.
 
-    Without this the traceback goes only to uvicorn's own logger, which writes
-    to server.log — so the recording log would show a start that produced no
-    recording and no reason why.
+    Otherwise the traceback goes only to uvicorn's logger and server.log, and
+    this log would show a start that produced no recording and no reason why.
     """
     logger.exception(
         "%s %s -> 500 unhandled error", request.method, request.url.path, exc_info=exc
@@ -277,8 +261,7 @@ async def log_unhandled_exception(request: Request, exc: Exception):
 
 @app.post("/recording/start")
 def start_recording(request: RecordingRequest):
-    # Config is re-read per request so edits to config.yaml take effect
-    # without restarting the server.
+    # Config is re-read per request, so edits apply without a restart.
     with http_errors(request.room_name):
         session = registry.start(request, load_config())
 
@@ -302,9 +285,9 @@ def stop_recording(request: RecordingRequest):
 
 @app.post("/recording/toggle")
 def toggle_recording(request: RecordingRequest):
-    # Deliberately not "ask whether it is recording, then call start or stop":
-    # the registry decides and acts under one lock, so two toggles arriving at
-    # the same moment cannot both find the room idle and both start.
+    # Not "ask whether it is recording, then start or stop": the registry
+    # decides and acts under one lock, so two toggles arriving together cannot
+    # both find the room idle and both start.
     with http_errors(request.room_name):
         started, session = registry.toggle(request, load_config())
 

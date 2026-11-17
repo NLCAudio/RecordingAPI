@@ -129,7 +129,7 @@ class AccessTest(unittest.TestCase):
             "headers": [],
             "app": main.app,
             "client": (client, 50000) if client else None,
-            "server": (self.THIS_SERVER, 8000),
+            "server": (self.THIS_SERVER, 8080),
         }
 
         async def endpoint(request):

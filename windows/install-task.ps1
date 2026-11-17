@@ -6,13 +6,11 @@
     Creates (or replaces) a Task Scheduler entry that runs run_server.py with
     pythonw.exe every time the given user logs on.
 
-    The trigger is "at log on" rather than "at startup" on purpose. A task set
-    to run at startup runs in session 0, without a desktop, and two things this
-    server needs do not reliably work there: DirectShow capture from Dante
-    Virtual Soundcard, and OneDrive, which is per-user and would leave the
-    recordings folder unsynced. Pair this with automatic log on so an
-    unattended machine reaches a desktop by itself after a power cut --
-    README.md explains how.
+    The trigger is "at log on", not "at startup", on purpose: a startup task
+    runs in session 0, without a desktop, where two things this server needs
+    do not work reliably: DirectShow capture from Dante Virtual Soundcard, and
+    OneDrive, which is per-user. Pair it with automatic log on for an
+    unattended machine; README.md explains how.
 
 .PARAMETER TaskName
     Name to register the task under. Re-running with the same name replaces it.
@@ -45,9 +43,8 @@ if (-not (Test-Path -LiteralPath $Launcher)) {
     throw "run_server.py not found at $Launcher. Run this script from the copy of the project you want to serve."
 }
 
-# pythonw.exe rather than python.exe: no console window appears when the task
-# starts, which is what run_server.py is written for. The project's own virtual
-# environment comes first so the task uses the dependencies installed for it.
+# pythonw.exe, not python.exe: no console window appears when the task starts.
+# The project's own virtual environment comes first, for its dependencies.
 $venvPythonw = Join-Path $ProjectDir '.venv\Scripts\pythonw.exe'
 if (Test-Path -LiteralPath $venvPythonw) {
     $Pythonw = $venvPythonw
@@ -65,8 +62,8 @@ $action = New-ScheduledTaskAction -Execute $Pythonw -Argument ('"{0}"' -f $Launc
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
 if ($DelaySeconds -gt 0) {
-    # Set as a property because New-ScheduledTaskTrigger has no -Delay for
-    # logon triggers. The format is an ISO 8601 duration.
+    # A property, because New-ScheduledTaskTrigger has no -Delay for logon
+    # triggers. The value is an ISO 8601 duration.
     $trigger.Delay = 'PT{0}S' -f $DelaySeconds
 }
 
@@ -102,7 +99,7 @@ Write-Host "  trigger   : at log on of $UserId, after $DelaySeconds seconds"
 Write-Host ""
 Write-Host "Start it now with:  Start-ScheduledTask -TaskName '$TaskName'"
 Write-Host "Then check that it answers on the port set as listenPort in config.yaml"
-Write-Host "(8000 unless changed):   curl http://127.0.0.1:8000/status"
+Write-Host "(8080 unless changed):   curl http://127.0.0.1:8080/status"
 Write-Host "If it does not come up, read server.log in the project folder."
 Write-Host ""
 Write-Host "This only starts the server once someone is logged on. For an" -ForegroundColor Yellow

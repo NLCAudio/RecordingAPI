@@ -13,7 +13,7 @@ from config import Config, local_url
 REQUIRED = {
     "inputDevice": "Dante Virtual Soundcard",
     "outputPath": "./recordings",
-    "companionBaseUrls": ["http://127.0.0.1:8001/"],
+    "companionBaseUrls": ["http://127.0.0.1:8000/"],
 }
 
 
@@ -24,7 +24,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(settings.framework, "auto")
         self.assertEqual(settings.bitrate, "128k")
         self.assertEqual(
-            (settings.listen_host, settings.listen_port), ("127.0.0.1", 8000)
+            (settings.listen_host, settings.listen_port), ("127.0.0.1", 8080)
         )
         self.assertIsNone(settings.server_name)
         self.assertIsNone(settings.audio_buffer_ms)
@@ -44,9 +44,9 @@ class ConfigTest(unittest.TestCase):
 
     def test_a_single_address_instead_of_a_list_says_what_to_write(self):
         with self.assertRaises(ValidationError) as raised:
-            Config(**{**REQUIRED, "companionBaseUrls": "http://127.0.0.1:8001"})
+            Config(**{**REQUIRED, "companionBaseUrls": "http://127.0.0.1:8000"})
         self.assertIn(
-            "companionBaseUrls:\n  - http://127.0.0.1:8001", str(raised.exception)
+            "companionBaseUrls:\n  - http://127.0.0.1:8000", str(raised.exception)
         )
 
     def test_addresses_are_tidied_and_deduplicated(self):
@@ -54,16 +54,16 @@ class ConfigTest(unittest.TestCase):
             **{
                 **REQUIRED,
                 "companionBaseUrls": [
-                    "http://127.0.0.1:8001/",
-                    " http://127.0.0.1:8001 ",
-                    "http://10.0.0.5:8001//",
+                    "http://127.0.0.1:8000/",
+                    " http://127.0.0.1:8000 ",
+                    "http://10.0.0.5:8000//",
                     "",
                 ],
             }
         )
         self.assertEqual(
             settings.companion_base_urls,
-            ["http://127.0.0.1:8001", "http://10.0.0.5:8001"],
+            ["http://127.0.0.1:8000", "http://10.0.0.5:8000"],
         )
 
     def test_an_empty_address_list_is_rejected(self):
@@ -92,11 +92,11 @@ class ConfigTest(unittest.TestCase):
 class LocalUrlTest(unittest.TestCase):
     def test_where_this_machine_reaches_the_server(self):
         cases = {
-            ("127.0.0.1", 8000): "http://127.0.0.1:8000",
+            ("127.0.0.1", 8080): "http://127.0.0.1:8080",
             # "Every address" is somewhere to listen, not somewhere to connect.
-            ("0.0.0.0", 8000): "http://127.0.0.1:8000",
+            ("0.0.0.0", 8080): "http://127.0.0.1:8080",
             ("192.168.1.20", 9000): "http://192.168.1.20:9000",
-            ("::", 8000): "http://[::1]:8000",
+            ("::", 8080): "http://[::1]:8080",
             ("::1", 8123): "http://[::1]:8123",
         }
         for (host, port), expected in cases.items():

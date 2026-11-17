@@ -17,23 +17,22 @@ LABEL="${RECORDING_API_LABEL:-local.recording-api}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE="gui/$(id -u)/$LABEL"
 
-# Where to reach the server: worked out from listenHost and listenPort in
-# config.yaml, by the same code the server reads them with. RECORDING_API_URL
-# overrides it. The fallback is the address used when neither is set.
+# Where to reach the server: listenHost and listenPort from config.yaml, worked
+# out by the server's own code. RECORDING_API_URL overrides it; the fallback is
+# the default address.
 BASE_URL="${RECORDING_API_URL:-}"
 if [ -z "$BASE_URL" ]; then
     if ! BASE_URL="$(cd "$PROJECT_DIR" && "$PROJECT_DIR/.venv/bin/python" -c \
         'from config import load_config; print(load_config().local_url)' 2>/dev/null)" ||
         [ -z "$BASE_URL" ]; then
-        BASE_URL="http://127.0.0.1:8000"
+        BASE_URL="http://127.0.0.1:8080"
         echo "warning: could not read the address from config.yaml; trying $BASE_URL" >&2
     fi
 fi
 
-# The server that is running now may not be at that address: if listenHost or
-# listenPort was edited since it started, it is still where it was. It wrote
-# that down when it started, so ask it there — and wait for the new one, at
-# the end, at the address from config.yaml.
+# The running server may be elsewhere: if listenHost or listenPort was edited
+# after it started, it is still at the address it noted then. Ask it there,
+# and wait for the new one at the address from config.yaml.
 RUNNING_URL="$BASE_URL"
 if [ -z "${RECORDING_API_URL:-}" ] && [ -s "$PROJECT_DIR/server.url" ]; then
     RUNNING_URL="$(head -n 1 "$PROJECT_DIR/server.url" | tr -d '[:space:]')"
@@ -61,8 +60,7 @@ fi
 
 # --- 1. Ask the running server what it is doing ------------------------------
 
-# A server that is not answering is not an error here: restarting one that is
-# already down is just starting it.
+# No answer is not an error: restarting a server that is down just starts it.
 rooms=()
 if status_json="$(curl -fsS --max-time 5 "$RUNNING_URL/status" 2>/dev/null)"; then
     # One room per line, because room names contain spaces.
@@ -95,8 +93,8 @@ if [ "${#rooms[@]}" -gt 0 ]; then
     for room in "${rooms[@]}"; do
         echo "Stopping recording in $room ..."
         body="$("$PYTHON" -c 'import json, sys; print(json.dumps({"room_name": sys.argv[1]}))' "$room")"
-        # Worth continuing if this fails: the restart is still wanted, and the
-        # flush settings leave a killed recording playable regardless.
+        # Worth continuing if this fails: the restart is still wanted, and a
+        # killed recording stays playable.
         curl -fsS --max-time 30 -X POST -H 'Content-Type: application/json' \
             -d "$body" "$RUNNING_URL/recording/stop" >/dev/null ||
             echo "  warning: could not stop $room cleanly" >&2
@@ -105,9 +103,8 @@ fi
 
 # --- 3. Restart the agent -----------------------------------------------------
 
-# -k stops the running server first. launchd also clears out whatever the
-# server left behind in its process group, so no ffmpeg survives to hold the
-# audio device open.
+# -k stops the running server first. launchd also clears out what the server
+# left in its process group, so no ffmpeg survives holding the audio device.
 echo "Restarting launchd agent '$LABEL' ..."
 if ! launchctl kickstart -k "$SERVICE"; then
     echo "error: launchd could not restart the agent." >&2
@@ -116,8 +113,8 @@ fi
 
 # --- 4. Wait until it actually answers ---------------------------------------
 
-# A syntax error in the code just changed would exit immediately and be
-# restarted in a loop, so confirm rather than assume.
+# A syntax error in the changed code would exit at once and be restarted in a
+# loop, so confirm rather than assume.
 sleep 1
 for _ in $(seq 1 60); do
     if curl -fsS --max-time 3 "$BASE_URL/status" >/dev/null 2>&1; then

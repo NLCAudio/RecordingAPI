@@ -44,8 +44,8 @@ def make_config(output_path, **overrides) -> Config:
 class ToneBackend:
     """A backend where ffmpeg produces the audio itself, as it does on Windows.
 
-    -re makes ffmpeg generate the tone in real time, the way a device delivers
-    it, rather than as fast as it can encode.
+    -re makes ffmpeg generate the tone in real time, like a device, rather
+    than as fast as it can encode.
     """
 
     def capture_input(self, left_channel, right_channel):

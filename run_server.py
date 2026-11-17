@@ -2,27 +2,24 @@
 Server launcher
 ===============
 
-The way the recording API is started: by hand with `python run_server.py`, by
-the Windows scheduled task, and by the macOS launchd agent. It listens where
+How the recording API is started: by hand with `python run_server.py`, by the
+Windows scheduled task, and by the macOS launchd agent. It listens where
 listenHost and listenPort in config.yaml say, and notes that address in
 server.url for the restart scripts.
 
-Running `uvicorn main:app` from a terminal is fine while developing, but a
-server started in the background has two problems this file solves:
+`uvicorn main:app` is fine while developing, but a server started in the
+background has two problems this file solves:
 
-  1. It starts in whatever folder the launcher happens to use — for Windows
-     Task Scheduler that is C:\\Windows\\System32. The relative paths in
-     config.yaml (outputPath, logPath) are resolved against the working
-     directory, so without the chdir below the recordings would be written
-     somewhere nobody would think to look.
+  1. It starts in whatever folder the launcher uses (C:\\Windows\\System32 for
+     Task Scheduler), and the relative paths in config.yaml (outputPath,
+     logPath) are resolved against the working directory. Hence the chdir.
 
-  2. Launched with pythonw.exe there is no console, so anything uvicorn
-     prints is thrown away — including the reason it failed to start. The
-     log config below sends uvicorn's own output to server.log instead.
+  2. Under pythonw.exe there is no console, so what uvicorn prints is thrown
+     away, including the reason it failed to start. The log config below sends
+     it to server.log instead.
 
-server.log holds start/stop and HTTP request lines. Recording problems —
-ffmpeg warnings, dropped packets — go to recording_api.log, set by logPath
-in config.yaml.
+server.log holds start/stop and HTTP request lines; recording problems go to
+recording_api.log (logPath in config.yaml).
 """
 
 import os
@@ -35,15 +32,13 @@ from config import Config, load_config, local_url
 PROJECT_DIR = Path(__file__).parent
 SERVER_LOG = PROJECT_DIR / "server.log"
 
-# The address this run of the server is listening on, written at start-up for
-# the restart scripts. config.yaml only says where the *next* start will
-# listen: once listenHost or listenPort has been edited, the server that is
-# still running is somewhere else, and a restart has to find it there to stop
-# its recordings cleanly.
+# The address this run of the server listens on, written at start-up for the
+# restart scripts. config.yaml only says where the next start will listen; once
+# it has been edited, a restart must find the running server where it still is
+# to stop its recordings cleanly.
 SERVER_URL_FILE = PROJECT_DIR / "server.url"
 
-# Same rotation as the recording log in main.py: 5 MB, 3 old files kept, so a
-# machine that is never looked at can't fill its disk with log files.
+# Same rotation as the recording log in main.py: 5 MB, 3 old files kept.
 LOG_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -59,16 +54,15 @@ LOG_CONFIG = {
             "backupCount": 3,
         },
     },
-    # uvicorn.error propagates up to "uvicorn", so it reaches the file handler
-    # too. uvicorn.access does not propagate by default and needs its own.
+    # uvicorn.error propagates up to "uvicorn" and so reaches the file handler;
+    # uvicorn.access does not propagate and needs its own.
     "loggers": {
         "uvicorn": {"handlers": ["file"], "level": "INFO", "propagate": False},
         "uvicorn.access": {"handlers": ["file"], "level": "INFO", "propagate": False},
     },
-    # Catches anything logged by a library we didn't name — without it those
-    # lines hit logging's "no handler" fallback and are written to a stderr
-    # that pythonw.exe discards. main.py opts recording_api out of this, so
-    # recording lines aren't written to both files.
+    # Catches what libraries we did not name log; otherwise it would go to a
+    # stderr that pythonw.exe discards. main.py opts recording_api out, so
+    # recording lines are not written to both files.
     "root": {"handlers": ["file"], "level": "WARNING"},
 }
 
@@ -79,9 +73,8 @@ def listen_address() -> tuple[str, int]:
         config = load_config()
     except Exception:
         # A broken config.yaml stops the server either way. Carrying on with
-        # the defaults lets uvicorn get as far as main.py's start-up, which
-        # writes the actual reason to the log before giving up — failing here
-        # instead would say nothing at all under pythonw.exe.
+        # the defaults lets uvicorn reach main.py's start-up, which logs the
+        # actual reason; failing here would say nothing under pythonw.exe.
         fields = Config.model_fields
         return fields["listen_host"].default, fields["listen_port"].default
     return config.listen_host, config.listen_port
@@ -93,16 +86,14 @@ if __name__ == "__main__":
     try:
         SERVER_URL_FILE.write_text(local_url(host, port) + "\n")
     except OSError:
-        # Only the restart scripts read it, and they fall back to config.yaml,
-        # so this is no reason to keep the server from starting.
+        # Only the restart scripts read it, and they fall back to config.yaml.
         pass
     uvicorn.run(
         "main:app",
         host=host,
         port=port,
         log_config=LOG_CONFIG,
-        # There is no proxy in front of this server, so the address a request
-        # comes from is the address of the machine that sent it — which is
-        # what acceptRequestsFrom checks — and never one a header claims.
+        # No proxy sits in front of this server, so the address acceptRequestsFrom
+        # checks is the sender's own, never one a header claims.
         proxy_headers=False,
     )

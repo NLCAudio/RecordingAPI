@@ -2,22 +2,20 @@
 Capture backend interface
 =========================
 
-Every operating system exposes audio devices differently, so the
-device-specific knowledge lives in the backends instead of being spread
-through recording.py.
+Every operating system exposes audio devices differently; that knowledge lives
+in the backends rather than in recording.py.
 
-A backend answers exactly one question:
+A backend answers one question:
 
     "I want channel L on the left and channel R on the right — where does
      ffmpeg get that audio, and how is it routed into a stereo stream?"
 
 Either ffmpeg opens the device itself (Windows), or the backend reads the
 device and feeds ffmpeg through a pipe (macOS); CaptureInput covers both.
-Everything after that (encoding to MP3, measuring dB levels, writing the file)
-is identical on every platform and stays in recording.py.
+Everything after that (MP3 encoding, level metering, writing the file) is the
+same on every platform and stays in recording.py.
 
-Channel numbers used by this interface are 1-based, exactly like the channel
-numbers shown in Dante Controller: channel 1 is the first channel.
+Channel numbers in this interface count from 1, as in Dante Controller.
 """
 
 import dataclasses
@@ -29,11 +27,10 @@ from typing import BinaryIO, Protocol
 from config import Config
 
 # How many audio packets ffmpeg may queue between reading a device and
-# processing them, on the backends where ffmpeg reads the device itself. A deep
-# queue lets its reader keep draining the device through a stall further down
-# (disk, encoder, thread scheduling). It does nothing about audio lost before
-# that reader, which is how avfoundation loses it, and whether dshow needs it
-# has not been measured.
+# processing them, where ffmpeg reads the device itself. A deep queue lets its
+# reader keep draining the device through a stall further down (disk, encoder,
+# scheduling). It does nothing about audio lost before that reader, which is
+# how avfoundation loses it; whether dshow needs it has not been measured.
 THREAD_QUEUE_SIZE = "4096"
 
 
@@ -43,15 +40,13 @@ class CaptureInput:
 
     # Every argument from the first -f up to and including the last -i.
     args: list[str]
-    # A filter graph consuming those inputs and producing one stereo stream,
-    # e.g. "[0:a]pan=stereo|c0=c0|c1=c1". recording.py appends the level
-    # metering to it and maps the result into the output file. A backend that
-    # needs more than one input (Windows) also combines them here.
+    # A filter graph turning those inputs into one stereo stream, e.g.
+    # "[0:a]pan=stereo|c0=c0|c1=c1", combining them first if there are several
+    # (Windows). recording.py appends the level metering and maps the output.
     filter_prefix: str
-    # Set when the audio does not come from an ffmpeg input device but is
-    # written into ffmpeg's stdin by the server (macOS). The recording then
-    # starts by calling feeder.start() with ffmpeg's stdin and ends by calling
-    # feeder.stop(), which closes that pipe — instead of sending ffmpeg "q".
+    # Set when the server itself writes the audio into ffmpeg's stdin (macOS).
+    # The recording then starts with feeder.start() and ends with feeder.stop(),
+    # which closes that pipe, instead of ffmpeg being sent "q".
     feeder: "AudioFeeder | None" = None
 
 
@@ -71,9 +66,9 @@ class AudioFeeder(Protocol):
 def pan_to_stereo(left_index: int, right_index: int) -> str:
     """Route two channels of the filter graph's input to left and right.
 
-    The indexes are 0-based positions *within* the graph's input, which is not
-    the channel number the caller asked for: on Windows channel 7 is channel 0
-    of the "7-8" device.
+    The indexes are 0-based positions within the graph's input, not the
+    channel numbers the caller asked for: on Windows channel 7 is channel 0 of
+    the "7-8" device.
     """
     return f"pan=stereo|c0=c{left_index}|c1=c{right_index}"
 
@@ -112,8 +107,7 @@ class CaptureBackend(ABC):
 
     def list_devices_output(self) -> str:
         # ffmpeg has no "just list the devices" mode: it prints the list, then
-        # complains that the empty input name does not exist and exits
-        # non-zero. That is expected — the list we want is in stderr either way.
+        # fails on the empty input name. The list is in stderr either way.
         result = subprocess.run(
             [
                 "ffmpeg",
@@ -148,7 +142,6 @@ class CaptureBackend(ABC):
 
     @staticmethod
     def normalise(name: str) -> str:
-        # Device names are padded so their numbers line up in ffmpeg's output
-        # ("DVS Receive  9-10" vs "DVS Receive 15-16"), so collapse runs of
-        # whitespace before comparing anything.
+        # Device names are padded to line their numbers up ("DVS Receive  9-10"
+        # vs "DVS Receive 15-16"), so collapse whitespace before comparing.
         return re.sub(r"\s+", " ", name).strip().lower()
