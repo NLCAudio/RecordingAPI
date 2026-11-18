@@ -2,7 +2,7 @@
 
 A lightweight HTTP server that starts, stops and monitors audio recordings, for live production where a control surface such as [Bitfocus Companion](https://bitfocus.io/companion) triggers recordings with a button press.
 
-It uses [ffmpeg](https://ffmpeg.org/) to encode the audio as MP3. On Windows ffmpeg also reads the audio device; on macOS the server reads it itself, because ffmpeg loses audio doing so there. While recording, it sends live audio levels (dB) to Companion so buttons can show a meter.
+It uses [ffmpeg](https://ffmpeg.org/) to encode the audio as MP3. While recording, it sends live audio levels (dB) to Companion so buttons can show a meter.
 
 It runs on macOS and Windows.
 
@@ -46,9 +46,9 @@ audioBufferMs: 200               # optional — see note below
 
 A setting the server does not know is an error, so a mistyped name is reported at start-up instead of silently never applying.
 
-`companionBaseUrls` is a list even for one address. Each address is pushed to from its own thread, so a Companion that is off or unreachable does not hold up the others; the failure is logged once, and again when it recovers.
+`companionBaseUrls` is a list even for one address. A Companion that is off or unreachable does not hold up the others; the failure is logged once, and again when it recovers.
 
-**`framework`** is best left at `auto`, which picks `audioqueue` on macOS, where the server reads the device itself through Apple's Audio Queue Services, and `dshow` on Windows. ffmpeg's own macOS capture, `avfoundation`, can still be selected by name, but it loses audio (about a tenth in a test on a MacBook's microphone) and has no setting to prevent that.
+**`framework`** is best left at `auto`, which picks `audioqueue` on macOS and `dshow` on Windows. ffmpeg's own macOS capture, `avfoundation`, can still be selected by name, but it loses audio.
 
 `audioBufferMs` is how much audio the capture may hold before any is lost. On Windows it is ffmpeg's capture buffer: leave it unset unless recordings drop audio, then raise it. On macOS the capture always holds at least 2000; if the log reports `lost … ms of audio`, set it higher.
 
@@ -72,11 +72,21 @@ A recording with a device name that does not exist is refused, and the error lis
 python run_server.py
 ```
 
-The Windows task and the macOS agent described below run the same thing. The server listens where `listenHost` and `listenPort` say, `http://127.0.0.1:8080` by default. The port is 8080 because Companion's own default is 8000.
+The Windows task and the macOS agent described below run the same thing. The server listens where `listenHost` and `listenPort` say, `http://127.0.0.1:8080` by default.
 
 Two logs are written to the project folder. `recording_api.log` is the one to read when a recording went wrong: starts and stops, everything ffmpeg said, lost audio, and every failed request. `server.log` has the web server's start-up messages and one line per request.
 
 While working on the code, `uvicorn main:app --reload` restarts the server whenever a file changes. It takes `--host` and `--port` instead of reading them from `config.yaml`.
+
+### Stopping
+
+```bash
+python stop_servers.py           # asks first if a room is recording
+python stop_servers.py --force   # stops without asking
+python stop_servers.py --list    # only shows what is running
+```
+
+This stops every recording API server running on the machine, however it was started and whichever port it listens on. Recordings are ended first, so each MP3 is finalised. The Windows task or macOS agent is stopped too; the server is back at the next log in, or when the restart script is run.
 
 ---
 
@@ -111,7 +121,7 @@ From the project folder, in PowerShell:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\install-task.ps1
 ```
 
-That registers a Task Scheduler entry, `RecordingAPI`, which runs `run_server.py` with `pythonw.exe` (no console window) 30 seconds after log on, restarts it up to three times if it fails, and has **no execution time limit**. Task Scheduler's default would stop it after three days, mid-week.
+That registers a Task Scheduler entry, `RecordingAPI`, which starts the server 30 seconds after log on, without a console window, and restarts it up to three times if it fails.
 
 Start it once without rebooting, then confirm:
 
@@ -120,25 +130,27 @@ Start-ScheduledTask -TaskName RecordingAPI
 curl http://127.0.0.1:8080/status
 ```
 
-If nothing answers, `server.log` in the project folder has the reason; `pythonw.exe` has no console to print it to.
+If nothing answers, `server.log` in the project folder has the reason.
 
 **Test the whole chain before you rely on it.** Cut power at the wall, restore it, and check that `/status` answers without anyone touching the machine.
 
-### Restarting after a code change
+### Restarting and stopping
 
 ```
 windows\restart.cmd
+windows\stop.cmd
 ```
 
-Double-click it or run it from a prompt. It stops any recording **through the API**, so each MP3 is finalised with an accurate duration header, kills the server as a process tree, starts it again and waits until it answers, so a syntax error in what you changed is reported instead of leaving a server that never came up.
+Double-click them or run them from a prompt. `restart.cmd` is for after a change to the code or to `config.yaml`: it stops the server, starts it again and waits until it answers, so a mistake in what you changed is reported instead of leaving a server that never came up. `stop.cmd` only stops it, until the next log on or `restart.cmd`.
 
-If a room is recording it asks first; `-Force` skips the prompt:
+Both stop every recording API server on the machine, as [`stop_servers.py`](#stopping) does, and end recordings first so each MP3 is finalised. If a room is recording they ask; `-Force` skips the question:
 
 ```
 windows\restart.cmd -Force
+windows\stop.cmd -Force
 ```
 
-Killing the server as a *tree* matters: ffmpeg is a child process, and an orphaned ffmpeg keeps the Dante device open, so the next recording fails to start. Stopping the server from Task Manager leaves one behind.
+Do not stop the server from Task Manager: that leaves its ffmpeg running, which keeps the Dante device open, so the next recording fails to start.
 
 ---
 
@@ -167,20 +179,21 @@ The server has to run in that logged-in session rather than as a system daemon: 
 macos/install-agent.sh
 ```
 
-That writes a launchd agent to `~/Library/LaunchAgents/local.recording-api.plist` and loads it. The server starts at every log in and is started again if it ever exits. The agent's `PATH` includes ffmpeg's folder, because launchd's default `PATH` leaves Homebrew out and every recording would otherwise fail with ffmpeg not found.
+That writes a launchd agent to `~/Library/LaunchAgents/local.recording-api.plist` and loads it. The server starts at every log in and is started again if it ever exits.
 
 **Start one test recording while sitting at the Mac.** The first time, macOS asks on screen whether to allow microphone access (and possibly access to the project's folder). Until that is answered, recordings fail.
 
 `macos/install-agent.sh --remove` takes the agent out again; `--print` shows the plist without installing it. If the server does not come up, look at `server.log` and `launchd.log` in the project folder.
 
-### Restarting after a code change
+### Restarting and stopping
 
 ```bash
 macos/restart.sh           # asks first if a room is recording
 macos/restart.sh --force   # restarts without asking
+macos/stop.sh              # stops only; takes --force too
 ```
 
-Like the Windows script, it stops recordings through the API so each MP3 is finalised, restarts the server, and waits until it answers.
+They work like the Windows scripts. After `stop.sh` the server stays stopped until the next log in or `restart.sh`.
 
 ---
 
@@ -206,7 +219,7 @@ Two machines (a Mac and a Windows PC, say) can record the same rooms and report 
      - 192.168.1.50        # the machine Companion runs on
    ```
 
-   The API has no log-in, so without `acceptRequestsFrom` whatever can reach the port can start and stop recordings. The server checks the list itself, so it works the same on macOS and Windows and does not depend on either firewall.
+   The API has no log-in, so without `acceptRequestsFrom` whatever can reach the port can start and stop recordings.
 
    On Windows the port also has to be let through the firewall. In an elevated PowerShell:
 
@@ -277,15 +290,17 @@ recordings/                      # outputPath
 
 The room and service are in the filename too, so a file still says what it is once copied out of its folder. Characters that cannot appear in a folder name (`/`, `\`, `:`, `<`, `>`, `"`, `|`, `?`, `*`) are replaced with `_`, which is logged; the recording still goes ahead.
 
+### While a recording is running
+
+Until it ends, a recording is kept in a hidden folder, `.in-progress`, inside `outputPath`, under the same room and service folders. When it ends it is moved to its place. So everything else in `outputPath` is a finished file: a job that copies or moves recordings elsewhere can take whatever it finds there, as long as it leaves `.in-progress` alone. The `path` in `/status` is where the file will be once it has ended.
+
 ---
 
 ## Surviving a power cut
 
-An interrupted recording (power lost, process killed) is left as a playable MP3 of everything captured up to roughly the last five seconds. Nothing has to be repaired: MP3 has no index or trailer that a clean stop is required to write.
+An interrupted recording (power lost, process killed) is left as a playable MP3 of everything captured up to roughly the last five seconds. Nothing has to be repaired. The file stays in `.in-progress` until the server is running again, which then moves it to its place.
 
-Two things make that hold. ffmpeg writes each MP3 frame to the file as it is encoded instead of buffering 256KB first, and the file is flushed from the operating system's cache to the disk every five seconds. Without the first, an interrupted recording loses up to sixteen seconds at 128k, and one shorter than that first buffer is left as an empty file.
-
-A recording stopped the normal way, through `/recording/stop` or `/recording/toggle`, is finalised by ffmpeg with an accurate duration header. So is whatever is recording when the server itself is asked to stop, by a restart script or by a Mac shutting down or logging out. Windows gives a background program no such warning at shutdown, so a recording still running then is left as an interrupted one.
+A recording stopped the normal way, through `/recording/stop` or `/recording/toggle`, is finalised by ffmpeg with an accurate duration header. So is whatever is recording when the server itself is asked to stop, by a restart or stop script or by a Mac shutting down or logging out. Windows gives a background program no such warning at shutdown, so a recording still running then is left as an interrupted one.
 
 ---
 

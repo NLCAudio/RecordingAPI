@@ -29,8 +29,7 @@ from config import Config
 # How many audio packets ffmpeg may queue between reading a device and
 # processing them, where ffmpeg reads the device itself. A deep queue lets its
 # reader keep draining the device through a stall further down (disk, encoder,
-# scheduling). It does nothing about audio lost before that reader, which is
-# how avfoundation loses it; whether dshow needs it has not been measured.
+# scheduling).
 THREAD_QUEUE_SIZE = "4096"
 
 

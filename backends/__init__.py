@@ -28,8 +28,7 @@ BACKENDS = {
 }
 
 FRAMEWORK_BY_PLATFORM = {
-    # Not avfoundation: ffmpeg loses audio capturing through it. It can still
-    # be asked for by name, for comparison.
+    # Not avfoundation: ffmpeg loses audio capturing through it.
     "darwin": AudioQueueBackend.framework,
     "win32": DShowBackend.framework,
 }
