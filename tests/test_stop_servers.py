@@ -404,7 +404,9 @@ class ServiceCommandsTest(unittest.TestCase):
 
         def run(command, **options):
             ran.append(command)
-            return mock.Mock(returncode=exit_code(command), stdout="")
+            return mock.Mock(
+                returncode=exit_code(command), stdout="", stderr="it says why"
+            )
 
         with (
             mock.patch.object(stop_servers.sys, "platform", platform),
@@ -444,6 +446,23 @@ class ServiceCommandsTest(unittest.TestCase):
                 ["launchctl", "print", service],  # gone: nothing to wait for
             ],
         )
+
+    def test_an_agent_that_stays_loaded_is_reported_with_launchds_reason(self):
+        said = io.StringIO()
+        with (
+            mock.patch.object(stop_servers, "EXIT_TIMEOUT_S", 0),
+            contextlib.redirect_stderr(said),
+        ):
+            self.commands("darwin", stop_servers.stop_service)
+        self.assertIn("launchd did not unload it: it says why", said.getvalue())
+
+    def test_a_process_windows_will_not_end_is_reported(self):
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said):
+            self.commands(
+                "win32", lambda: stop_servers.stop_processes([42]), lambda command: 1
+            )
+        self.assertIn("could not end process 42: it says why", said.getvalue())
 
     def test_an_agent_that_is_not_loaded_is_left_alone(self):
         service = f"gui/501/{stop_servers.LAUNCHD_LABEL}"

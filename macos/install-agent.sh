@@ -26,19 +26,6 @@ PYTHON="$PROJECT_DIR/.venv/bin/python"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 
-# Where to reach the server: listenHost and listenPort from config.yaml, worked
-# out by the server's own code. RECORDING_API_URL overrides it; the fallback is
-# the default address.
-BASE_URL="${RECORDING_API_URL:-}"
-if [ -z "$BASE_URL" ]; then
-    if ! BASE_URL="$(cd "$PROJECT_DIR" && "$PROJECT_DIR/.venv/bin/python" -c \
-        'from config import load_config; print(load_config().local_url)' 2>/dev/null)" ||
-        [ -z "$BASE_URL" ]; then
-        BASE_URL="http://127.0.0.1:8080"
-        echo "warning: could not read the address from config.yaml; trying $BASE_URL" >&2
-    fi
-fi
-
 # Paths go into XML, where these three characters would end the document early.
 xml_escape() {
     printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
@@ -81,13 +68,6 @@ render_plist() {
          for the same treatment an app in the foreground gets. -->
     <key>ProcessType</key>
     <string>Interactive</string>
-
-    <!-- run_server.py sends uvicorn's log to server.log itself; this catches
-         what is printed before that is set up, such as an import error. -->
-    <key>StandardOutPath</key>
-    <string>$(xml_escape "$PROJECT_DIR/launchd.log")</string>
-    <key>StandardErrorPath</key>
-    <string>$(xml_escape "$PROJECT_DIR/launchd.log")</string>
 </dict>
 </plist>
 EOF
@@ -152,7 +132,13 @@ echo "  plist     : $PLIST"
 echo
 
 # Loading the agent starts it, but that only means launchd launched it; wait
-# for it to answer.
+# for it to answer, at listenHost and listenPort from config.yaml as the
+# server's own code works them out. RECORDING_API_URL overrides that. If
+# config.yaml cannot be used, config.py says why and the default is tried.
+BASE_URL="${RECORDING_API_URL:-}"
+if [ -z "$BASE_URL" ] && ! BASE_URL="$("$PYTHON" "$PROJECT_DIR/config.py")"; then
+    BASE_URL="http://127.0.0.1:8080"
+fi
 up=""
 for _ in $(seq 1 60); do
     if curl -fsS --max-time 3 "$BASE_URL/status" >/dev/null 2>&1; then
@@ -165,7 +151,7 @@ if [ -n "$up" ]; then
     echo "Recording API is up on $BASE_URL"
 else
     echo "The server did not answer within 30 seconds." >&2
-    echo "Look at server.log and launchd.log in $PROJECT_DIR for the reason." >&2
+    echo "Look in $PROJECT_DIR/logs for the reason." >&2
 fi
 
 # The agent only helps if the Mac itself comes back and stays awake. Reported,

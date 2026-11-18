@@ -41,6 +41,7 @@ listenHost: 127.0.0.1            # 0.0.0.0 to accept requests from other machine
 listenPort: 8080
 acceptRequestsFrom:              # optional — the other machines that may use the API
   - 192.168.1.50
+debugMode: false                 # true only while setting up — see note below
 audioBufferMs: 200               # optional — see note below
 ```
 
@@ -52,7 +53,9 @@ A setting the server does not know is an error, so a mistyped name is reported a
 
 `audioBufferMs` is how much audio the capture may hold before any is lost. On Windows it is ffmpeg's capture buffer: leave it unset unless recordings drop audio, then raise it. On macOS the capture always holds at least 2000; if the log reports `lost … ms of audio`, set it higher.
 
-`acceptRequestsFrom` lists the machines that may use the API, as addresses (`192.168.1.50`) or ranges (`192.168.1.0/24`). The API has no log-in, so on a server other machines can reach, this list is what stops just any of them starting and stopping recordings: other addresses get a `403`, noted in `recording_api.log`. The machine the server runs on is always allowed. Left out, every address is accepted, and a server listening on the network says so in its log at start-up.
+`acceptRequestsFrom` lists the machines that may use the API, as addresses (`192.168.1.50`) or ranges (`192.168.1.0/24`). The API has no log-in, so on a server other machines can reach, this list is what stops just any of them starting and stopping recordings: other addresses get a `403`, noted in the log. The machine the server runs on is always allowed. Left out, every address is accepted, and a server listening on the network says so in its log at start-up.
+
+`debugMode: true` is for setting up. Requests are then accepted from every address, whatever `acceptRequestsFrom` says, and the log names each address the list would have refused, which is how to find out what belongs on it. The log repeats a warning every ten minutes until `debugMode` is turned off again.
 
 `inputDevice`, `framework`, `bitrate`, `audioBufferMs` and `outputPath` are read again for every recording, so a change applies to the next one. Everything else is read once, at start-up, and needs a restart.
 
@@ -74,7 +77,9 @@ python run_server.py
 
 The Windows task and the macOS agent described below run the same thing. The server listens where `listenHost` and `listenPort` say, `http://127.0.0.1:8080` by default.
 
-Two logs are written to the project folder. `recording_api.log` is the one to read when a recording went wrong: starts and stops, everything ffmpeg said, lost audio, and every failed request. `server.log` has the web server's start-up messages and one line per request.
+Started from a terminal like this, the server shows its logs on screen, so one that does not start says why.
+
+The logs are kept in the `logs` folder of the project. `recording_api.log` is the one to read when a recording went wrong: starts and stops, everything ffmpeg said, lost audio, and every failed request. `server.log` has the web server's start-up messages and one line per request. `console.log` has what the server printed while running in the background, where there is no screen to show it: mostly the error that stopped it.
 
 While working on the code, `uvicorn main:app --reload` restarts the server whenever a file changes. It takes `--host` and `--port` instead of reading them from `config.yaml`.
 
@@ -130,7 +135,7 @@ Start-ScheduledTask -TaskName RecordingAPI
 curl http://127.0.0.1:8080/status
 ```
 
-If nothing answers, `server.log` in the project folder has the reason.
+If nothing answers, the `logs` folder has the reason.
 
 **Test the whole chain before you rely on it.** Cut power at the wall, restore it, and check that `/status` answers without anyone touching the machine.
 
@@ -183,7 +188,7 @@ That writes a launchd agent to `~/Library/LaunchAgents/local.recording-api.plist
 
 **Start one test recording while sitting at the Mac.** The first time, macOS asks on screen whether to allow microphone access (and possibly access to the project's folder). Until that is answered, recordings fail.
 
-`macos/install-agent.sh --remove` takes the agent out again; `--print` shows the plist without installing it. If the server does not come up, look at `server.log` and `launchd.log` in the project folder.
+`macos/install-agent.sh --remove` takes the agent out again; `--print` shows the plist without installing it. If the server does not come up, look in the `logs` folder.
 
 ### Restarting and stopping
 

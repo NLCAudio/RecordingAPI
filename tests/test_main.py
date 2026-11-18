@@ -10,6 +10,7 @@ from starlette.requests import Request
 
 import main
 from backends import ChannelNotAvailableError, DeviceNotFoundError
+from config import ConfigError
 from recording import WORK_FOLDER, RecordingRequest
 from tests.support import make_config
 
@@ -40,6 +41,11 @@ class HttpErrorsTest(unittest.TestCase):
     def test_a_machine_problem_is_reported_as_such(self):
         status, detail = self.status_for(OSError("recording folder is not writable"))
         self.assertEqual((status, detail), (400, "recording folder is not writable"))
+
+    def test_an_unusable_config_is_reported_with_the_reason(self):
+        # config.yaml is read again for every recording.
+        unusable = ConfigError("config.yaml cannot be used: listenPortt: not known")
+        self.assertEqual(self.status_for(unusable), (400, str(unusable)))
 
 
 class EndpointTest(unittest.TestCase):
@@ -119,6 +125,24 @@ class StartUpTest(unittest.TestCase):
             self.assertFalse(leftover.exists())
         self.assertTrue(any("moved a leftover recording" in line for line in logged))
 
+    def test_an_unusable_config_stops_the_start_and_says_why(self):
+        unusable = ConfigError("config.yaml cannot be used: listenPortt: not known")
+
+        async def start():
+            async with main.lifespan(main.app):
+                self.fail("the server started")
+
+        with (
+            mock.patch.object(main, "load_config", side_effect=unusable),
+            mock.patch.object(main, "setup_logging") as setup_logging,
+            self.assertLogs("recording_api", level="ERROR") as logs,
+            self.assertRaises(ConfigError),
+        ):
+            asyncio.run(start())
+
+        setup_logging.assert_called_once_with(main.DEFAULT_LOG_PATH)
+        self.assertIn(f"startup failed: {unusable}", logs.output[0])
+
     def test_the_check_goes_on_for_as_long_as_the_server_runs(self):
         with tempfile.TemporaryDirectory() as folder:
             # The server crashed and came straight back: written to moments
@@ -139,6 +163,49 @@ class StartUpTest(unittest.TestCase):
         self.assertEqual(already_logged, [(fresh, "still being written")])
         thread.return_value.start.assert_called_once_with()
         self.assertTrue(stopped.is_set())  # it ends with the server
+
+
+class LoggingTest(unittest.TestCase):
+    """Where the application log goes."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.log_path = Path(folder.name) / "logs" / "recording_api.log"
+
+        # Afterwards the logger is put back as the other tests have it.
+        logger = main.logger
+        before = (list(logger.handlers), logger.level, logger.propagate)
+
+        def restore():
+            for handler in logger.handlers:
+                handler.close()
+            logger.handlers[:] = before[0]
+            logger.setLevel(before[1])
+            logger.propagate = before[2]
+
+        self.addCleanup(restore)
+
+    def handlers_with(self, stderr):
+        with mock.patch.object(main.sys, "stderr", stderr):
+            main.setup_logging(self.log_path)
+        return [type(handler).__name__ for handler in main.logger.handlers]
+
+    def test_the_folder_for_the_log_is_created(self):
+        self.handlers_with(None)
+        self.assertTrue(self.log_path.parent.is_dir())
+
+    def test_in_the_background_it_goes_to_the_file_only(self):
+        # No console under pythonw.exe; not a terminal under launchd.
+        for stderr in (None, mock.Mock(isatty=lambda: False)):
+            with self.subTest(stderr):
+                self.assertEqual(self.handlers_with(stderr), ["RotatingFileHandler"])
+
+    def test_started_from_a_terminal_it_is_shown_there_too(self):
+        self.assertEqual(
+            self.handlers_with(mock.Mock(isatty=lambda: True)),
+            ["RotatingFileHandler", "StreamHandler"],
+        )
 
 
 class AccessTest(unittest.TestCase):
@@ -212,6 +279,56 @@ class AccessTest(unittest.TestCase):
         ):
             self.ask(self.STRANGER)
         self.assertEqual(len(logs.output), 1)
+
+    def in_debug_mode(self):
+        self.use(
+            make_config("out", accept_requests_from=[self.COMPANION], debug_mode=True)
+        )
+
+    def test_in_debug_mode_an_unlisted_address_is_served_and_noted(self):
+        self.in_debug_mode()
+
+        with self.assertLogs("recording_api", level="WARNING") as logs:
+            for _ in range(3):
+                self.assertEqual(self.ask(self.STRANGER), "served")
+
+        # Once, with the address: what would have to go on the list.
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(
+            f"debugMode let in POST /recording/start from {self.STRANGER}",
+            logs.output[0],
+        )
+
+    def test_in_debug_mode_a_listed_address_is_not_noted(self):
+        self.in_debug_mode()
+
+        with self.assertNoLogs("recording_api"):
+            self.assertEqual(self.ask(self.COMPANION), "served")
+
+    def test_start_up_warns_that_debug_mode_is_on_and_goes_on_warning(self):
+        with mock.patch.object(main.threading, "Thread") as thread:
+            logged = run_lifespan(self, make_config("out", debug_mode=True))
+
+        self.assertTrue(any("debugMode is on" in line for line in logged))
+        started = [call.kwargs["target"] for call in thread.call_args_list]
+        self.assertIn(main.keep_warning_about_debug_mode, started)
+
+    def test_without_debug_mode_nothing_warns_about_it(self):
+        with mock.patch.object(main.threading, "Thread") as thread:
+            logged = run_lifespan(self, make_config("out"))
+
+        self.assertFalse(any("debugMode" in line for line in logged))
+        started = [call.kwargs["target"] for call in thread.call_args_list]
+        self.assertNotIn(main.keep_warning_about_debug_mode, started)
+
+    def test_the_debug_mode_warning_is_repeated_until_the_server_stops(self):
+        waits = iter([False, False, True])  # two intervals pass, then it stops
+        stopped = mock.Mock(wait=lambda seconds: next(waits))
+
+        with self.assertLogs("recording_api", level="WARNING") as logs:
+            main.keep_warning_about_debug_mode(stopped)
+
+        self.assertEqual(len(logs.output), 2)
 
     def test_without_a_list_everyone_is_served(self):
         self.use(make_config("out"))

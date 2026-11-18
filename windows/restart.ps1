@@ -49,25 +49,21 @@ if (-not (Test-Path -LiteralPath $python)) { $python = 'python.exe' }
 # config.yaml, worked out by the server's own code, unless -BaseUrl was given.
 if (-not $BaseUrl) {
     $answer = $null
-    Push-Location $ProjectDir
     try {
-        $answer = & $python -c 'from config import load_config; print(load_config().local_url)' 2>$null |
-            Select-Object -Last 1
+        $answer = & $python (Join-Path $ProjectDir 'config.py') | Select-Object -Last 1
     }
     catch {
         $answer = $null
-    }
-    finally {
-        Pop-Location
     }
 
     if ($answer -and "$answer".Trim() -like 'http*') {
         $BaseUrl = "$answer".Trim()
     }
     else {
-        # The address used when config.yaml sets neither value.
-        $BaseUrl = 'http://127.0.0.1:8080'
-        Write-Warning "Could not read the address from config.yaml; trying $BaseUrl"
+        # config.py has said why config.yaml cannot be used. The new server
+        # could not start with it either, so the running one is left alone.
+        Write-Host "Nothing changed." -ForegroundColor Red
+        exit 1
     }
 }
 
@@ -129,6 +125,6 @@ if ($up) {
 }
 else {
     Write-Host "The server did not answer within 30 seconds." -ForegroundColor Red
-    Write-Host "Look at $(Join-Path $ProjectDir 'server.log') for the reason." -ForegroundColor Red
+    Write-Host "Look in $(Join-Path $ProjectDir 'logs') for the reason." -ForegroundColor Red
     exit 1
 }

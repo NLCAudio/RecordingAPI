@@ -11,15 +11,17 @@ map between the two.
 """
 
 import ipaddress
+import sys
 from ipaddress import IPv4Network, IPv6Network
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 EXAMPLE_CONFIG_PATH = Path(__file__).parent / "config.example.yaml"
-DEFAULT_LOG_PATH = Path(__file__).parent / "recording_api.log"
+# Next to the other logs, which run_server.py keeps in the same folder.
+DEFAULT_LOG_PATH = Path(__file__).parent / "logs" / "recording_api.log"
 
 
 class Config(BaseModel):
@@ -64,6 +66,11 @@ class Config(BaseModel):
     accept_requests_from: list[IPv4Network | IPv6Network] = Field(
         default_factory=list, alias="acceptRequestsFrom"
     )
+    # For setting up: requests are accepted from every address, whatever
+    # accept_requests_from says. The log names each address that list would
+    # have refused, and keeps warning for as long as this is on. Read once at
+    # start-up.
+    debug_mode: bool = Field(False, alias="debugMode")
     # This server's name when more than one reports to the same Companion (a Mac
     # and a Windows machine recording the same rooms, say). The status then goes
     # to the custom variable recording_status_<serverName>, so the servers do
@@ -113,7 +120,9 @@ class Config(BaseModel):
         if entries is None:
             return []  # the key written with nothing under it
         if isinstance(entries, str):
-            raise TypeError(
+            # ValueError, although it is about the type: pydantic only turns
+            # that into an error naming the setting.
+            raise ValueError(  # noqa: TRY004
                 "expected a list of addresses, not a single one. Write it as:\n"
                 f"acceptRequestsFrom:\n  - {entries}"
             )
@@ -139,7 +148,7 @@ class Config(BaseModel):
         # A bare address is a common thing to write, and pydantic would only
         # answer "input should be a valid list".
         if isinstance(urls, str):
-            raise TypeError(
+            raise ValueError(  # noqa: TRY004 (as above)
                 "expected a list of addresses, not a single one. Write it as:\n"
                 f"companionBaseUrls:\n  - {urls}"
             )
@@ -167,18 +176,50 @@ def local_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
 
+class ConfigError(OSError):
+    """config.yaml is missing or cannot be used; the message says why.
+
+    An OSError, so the API reports it like any other problem with the machine
+    that pressing the button again will not fix.
+    """
+
+
 def load_config() -> Config:
     # Read per request, not cached, so the settings a recording uses (device,
     # framework, bitrate, buffer, output folder) apply to the next recording
     # without a restart. The rest are read once at start-up: listen address,
-    # accepted addresses, Companion addresses, push rate, server name, log path.
+    # accepted addresses, debug mode, Companion addresses, push rate, server
+    # name, log path.
     try:
         with open(CONFIG_PATH, "r") as file:
-            return Config(**yaml.safe_load(file))
+            settings = yaml.safe_load(file)
     except FileNotFoundError:
         # config.yaml is each machine's own and not in the repository, so a
         # fresh copy of the project does not have one yet.
-        raise FileNotFoundError(
+        raise ConfigError(
             f"{CONFIG_PATH.name} not found. Copy {EXAMPLE_CONFIG_PATH.name} to "
             f"{CONFIG_PATH.name} in {CONFIG_PATH.parent} and fill it in."
         ) from None
+    except (OSError, yaml.YAMLError) as e:
+        raise ConfigError(f"{CONFIG_PATH.name} cannot be used: {e}") from e
+
+    if not isinstance(settings, dict):  # empty, or just a list
+        raise ConfigError(f"{CONFIG_PATH.name} cannot be used: it holds no settings")
+    try:
+        return Config(**settings)
+    except ValidationError as e:
+        # Each setting turned down and why, without pydantic's own preamble.
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in problem['loc'])}: {problem['msg']}"
+            for problem in e.errors(include_url=False)
+        )
+        raise ConfigError(f"{CONFIG_PATH.name} cannot be used: {problems}") from e
+
+
+if __name__ == "__main__":
+    # For the restart and install scripts: where this machine reaches the
+    # server, or why config.yaml cannot say.
+    try:
+        print(load_config().local_url)
+    except ConfigError as e:
+        sys.exit(f"error: {e}")

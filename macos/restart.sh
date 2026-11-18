@@ -43,15 +43,12 @@ fi
 
 # Where the restarted server will answer: listenHost and listenPort from
 # config.yaml, worked out by the server's own code. RECORDING_API_URL overrides
-# it; the fallback is the default address.
+# it. If config.yaml cannot be used, config.py says why, and the running server
+# is left alone: the new one could not start with it either.
 BASE_URL="${RECORDING_API_URL:-}"
-if [ -z "$BASE_URL" ]; then
-    if ! BASE_URL="$(cd "$PROJECT_DIR" && "$PYTHON" -c \
-        'from config import load_config; print(load_config().local_url)' 2>/dev/null)" ||
-        [ -z "$BASE_URL" ]; then
-        BASE_URL="http://127.0.0.1:8080"
-        echo "warning: could not read the address from config.yaml; trying $BASE_URL" >&2
-    fi
+if [ -z "$BASE_URL" ] && ! BASE_URL="$("$PYTHON" "$PROJECT_DIR/config.py")"; then
+    echo "Nothing changed." >&2
+    exit 1
 fi
 
 # --- 1. Stop every server on this Mac ----------------------------------------
@@ -85,5 +82,5 @@ done
 
 echo
 echo "The server did not answer within 30 seconds." >&2
-echo "Look at server.log and launchd.log in $PROJECT_DIR for the reason." >&2
+echo "Look in $PROJECT_DIR/logs for the reason." >&2
 exit 1

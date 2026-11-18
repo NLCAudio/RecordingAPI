@@ -268,14 +268,22 @@ def stop_service() -> None:
         if not launchd_has(service):
             return
         print(f"Unloading launchd agent '{LAUNCHD_LABEL}' ...")
-        subprocess.run(
-            ["launchctl", "bootout", service], capture_output=True, check=False
+        unloading = subprocess.run(
+            ["launchctl", "bootout", service],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         # bootout can return before the server has ended its recordings and
         # exited, and until then the agent cannot be loaded again.
         deadline = time.monotonic() + EXIT_TIMEOUT_S
-        while launchd_has(service) and time.monotonic() < deadline:
+        while (loaded := launchd_has(service)) and time.monotonic() < deadline:
             time.sleep(0.5)
+        if loaded:
+            print(
+                f"  warning: launchd did not unload it: {unloading.stderr.strip()}",
+                file=sys.stderr,
+            )
 
 
 def launchd_has(service: str) -> bool:
@@ -292,11 +300,20 @@ def stop_processes(pids: list[int]) -> None:
             # Windows has no polite request for a program without a window.
             # /T takes the whole tree: an ffmpeg left behind keeps the audio
             # device open, and the next recording then fails to start.
-            subprocess.run(
+            killing = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
+                text=True,
+                errors="replace",
                 check=False,
             )
+            # 128: there is no such process, because the task took it with it.
+            if killing.returncode not in (0, 128):
+                print(
+                    f"  warning: could not end process {pid}: "
+                    f"{(killing.stderr or killing.stdout).strip()}",
+                    file=sys.stderr,
+                )
         return
 
     # SIGTERM is the polite request: the server ends its recordings and exits.

@@ -29,6 +29,7 @@ This file holds only the HTTP layer. The work behind it lives in:
 
 import ipaddress
 import logging
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -46,7 +47,7 @@ from starlette.responses import JSONResponse
 
 from backends import ChannelNotAvailableError, DeviceNotFoundError
 from companion import start_status_push, variable_name
-from config import DEFAULT_LOG_PATH, Config, load_config
+from config import DEFAULT_LOG_PATH, Config, ConfigError, load_config
 from recording import (
     RecordingRequest,
     SessionRegistry,
@@ -68,25 +69,41 @@ registry = SessionRegistry()
 # arrives, so the list cannot change under a running service by accident.
 startup_config: Config | None = None
 
-# How often a refused address is logged. A machine retrying many times a second
-# would otherwise bury everything else.
+# How often an address that is not listed is logged. A machine retrying many
+# times a second would otherwise bury everything else.
 REFUSAL_LOG_INTERVAL_S = 60.0
 
-# When each refused address was last logged.
+# When each address that is not listed was last logged.
 refusals_logged_at: dict[str, float] = {}
+
+# Logged at start-up and again this often while debugMode is on, so that it is
+# not left on unnoticed once the server is set up.
+DEBUG_MODE_WARNING_INTERVAL_S = 600.0
+DEBUG_MODE_WARNING = (
+    "debugMode is on: requests are accepted from every address, whatever "
+    "acceptRequestsFrom says. Once the server is set up, turn it off in "
+    "config.yaml and restart."
+)
 
 
 def setup_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     # Rotate at 5 MB, keeping 3 old files, so the log cannot grow without bound
     # on a machine that is rarely looked at.
-    handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=3)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=3)
+    ]
+    if sys.stderr is not None and sys.stderr.isatty():
+        # Started from a terminal, where someone is watching: show it there too.
+        handlers.append(logging.StreamHandler())
     # A second call (a reload, or a retried start-up) would otherwise write
     # every line once per handler.
     for existing in list(logger.handlers):
         logger.removeHandler(existing)
         existing.close()
-    logger.addHandler(handler)
+    for handler in handlers:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     # run_server.py gives the root logger a handler on server.log; without this
     # every line would go to both files.
@@ -97,11 +114,11 @@ def setup_logging(log_path: Path) -> None:
 async def lifespan(app: FastAPI):
     try:
         config = load_config()
-    except Exception:
+    except ConfigError as e:
         # A broken config.yaml does not say where the log belongs, so use the
         # default path; otherwise the server would just never come up, silently.
         setup_logging(DEFAULT_LOG_PATH)
-        logger.exception("startup failed: could not read config.yaml")
+        logger.error("startup failed: %s", e)
         raise
 
     setup_logging(config.log_path)
@@ -118,7 +135,15 @@ async def lifespan(app: FastAPI):
         daemon=True,
         name="leftovers",
     ).start()
-    if config.accept_requests_from:
+    if config.debug_mode:
+        logger.warning(DEBUG_MODE_WARNING)
+        threading.Thread(
+            target=keep_warning_about_debug_mode,
+            args=(shutting_down,),
+            daemon=True,
+            name="debug-mode",
+        ).start()
+    elif config.accept_requests_from:
         logger.info(
             "Accepting requests from this machine and from %s",
             ", ".join(str(network) for network in config.accept_requests_from),
@@ -164,23 +189,31 @@ def accepts_other_machines(listen_host: str) -> bool:
 async def refuse_unlisted_addresses(request: Request, call_next):
     """Turn away requests from addresses not listed under acceptRequestsFrom.
 
-    The one place access is decided, for every endpoint.
+    The one place access is decided, for every endpoint. With debugMode on
+    they are let in and logged, so the list can be completed from the log.
     """
     client = request.client.host if request.client else None
     server = request.scope.get("server")
-    if startup_config is None or startup_config.allows(
-        client, server[0] if server else None
-    ):
+    config = startup_config
+    if config is None or config.allows(client, server[0] if server else None):
         return await call_next(request)
 
-    log_refusal(client, request)
+    log_unlisted(client, request, let_in=config.debug_mode)
+    if config.debug_mode:
+        return await call_next(request)
     return JSONResponse(
         status_code=403,
         content={"detail": "This address is not allowed to use the recording API"},
     )
 
 
-def log_refusal(client: str | None, request: Request) -> None:
+def keep_warning_about_debug_mode(stopped: threading.Event) -> None:
+    """Repeat the warning for as long as the server runs with debugMode on."""
+    while not stopped.wait(DEBUG_MODE_WARNING_INTERVAL_S):
+        logger.warning(DEBUG_MODE_WARNING)
+
+
+def log_unlisted(client: str | None, request: Request, let_in: bool) -> None:
     now = time.monotonic()
     address = client or "an unknown address"
     last_logged = refusals_logged_at.get(address)
@@ -193,8 +226,9 @@ def log_refusal(client: str | None, request: Request) -> None:
         refusals_logged_at.clear()
     refusals_logged_at[address] = now
     logger.warning(
-        "refused %s %s from %s, which is not listed under acceptRequestsFrom (further "
+        "%s %s %s from %s, which is not listed under acceptRequestsFrom (further "
         "requests from it are not logged for the next %.0f s)",
+        "debugMode let in" if let_in else "refused",
         request.method,
         request.url.path,
         address,
@@ -226,8 +260,9 @@ def http_errors(room_name: str):
         logger.warning("[%s] 422 %s", room_name, e.message)
         raise LoggedHTTPException(status_code=422, detail=e.message)
     except OSError as e:
-        # Most likely ffmpeg is missing or the output folder is not writable.
-        # Retrying will not help; someone has to fix the machine, hence an error.
+        # ffmpeg is missing, the output folder is not writable, or config.yaml
+        # cannot be used. Retrying will not help; someone has to fix the
+        # machine, hence an error.
         logger.error("[%s] 400 %s", room_name, e)
         raise LoggedHTTPException(status_code=400, detail=str(e))
 

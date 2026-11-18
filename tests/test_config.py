@@ -1,3 +1,6 @@
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -81,6 +84,13 @@ class ConfigTest(unittest.TestCase):
         for unusable in (0, 65536):
             with self.subTest(unusable), self.assertRaises(ValidationError):
                 Config(**REQUIRED, listenPort=unusable)
+
+    def test_debug_mode_is_off_unless_asked_for(self):
+        self.assertFalse(Config(**REQUIRED).debug_mode)
+        self.assertTrue(Config(**REQUIRED, debugMode=True).debug_mode)
+
+    def test_the_log_is_kept_in_the_logs_folder(self):
+        self.assertEqual(Config(**REQUIRED).log_path.parent.name, "logs")
 
     def test_the_example_config_is_valid(self):
         # The template people copy, so it has to load as it stands.
@@ -198,10 +208,68 @@ class LoadConfigTest(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as folder,
             mock.patch.object(config, "CONFIG_PATH", Path(folder) / "config.yaml"),
-            self.assertRaises(FileNotFoundError) as raised,
+            self.assertRaises(config.ConfigError) as raised,
         ):
             config.load_config()
         self.assertIn("config.example.yaml", str(raised.exception))
+
+    def error_for(self, content):
+        """What loading a config.yaml with this content says is wrong."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.yaml"
+            path.write_text(content)
+            with (
+                mock.patch.object(config, "CONFIG_PATH", path),
+                self.assertRaises(config.ConfigError) as raised,
+            ):
+                config.load_config()
+        return str(raised.exception)
+
+    def test_a_mistyped_setting_is_named_without_the_preamble(self):
+        said = self.error_for(yaml.safe_dump({**REQUIRED, "listenPortt": 8080}))
+
+        self.assertIn("config.yaml cannot be used: listenPortt: ", said)
+        self.assertNotIn("validation error", said)
+        self.assertNotIn("https://", said)
+
+    def test_a_single_address_says_what_to_write_instead(self):
+        one_address = {**REQUIRED, "companionBaseUrls": "http://127.0.0.1:8000"}
+        said = self.error_for(yaml.safe_dump(one_address))
+
+        self.assertIn("companionBaseUrls:\n  - http://127.0.0.1:8000", said)
+
+    def test_a_file_that_is_not_yaml_or_holds_no_settings_is_an_error_too(self):
+        for content in ("bitrate: [unclosed", "", "- just\n- a list\n"):
+            with self.subTest(content):
+                self.assertIn("config.yaml cannot be used", self.error_for(content))
+
+
+class CommandLineTest(unittest.TestCase):
+    """`python config.py`, which the restart and install scripts ask."""
+
+    def run_it(self, settings):
+        # A copy in a folder of its own, away from this machine's config.yaml.
+        with tempfile.TemporaryDirectory() as folder:
+            shutil.copy(config.__file__, folder)
+            (Path(folder) / "config.yaml").write_text(yaml.safe_dump(settings))
+            return subprocess.run(
+                [sys.executable, str(Path(folder) / "config.py")],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_it_prints_where_this_machine_reaches_the_server(self):
+        done = self.run_it({**REQUIRED, "listenHost": "0.0.0.0", "listenPort": 8123})
+
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(done.stdout.strip(), "http://127.0.0.1:8123")
+
+    def test_it_says_why_config_yaml_cannot_be_used(self):
+        done = self.run_it({**REQUIRED, "listenPortt": 8080})
+
+        self.assertEqual((done.returncode, done.stdout), (1, ""))
+        self.assertIn("error: config.yaml cannot be used: listenPortt", done.stderr)
 
 
 if __name__ == "__main__":

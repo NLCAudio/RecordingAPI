@@ -100,7 +100,7 @@ Write-Host ""
 Write-Host "Start it now with:  Start-ScheduledTask -TaskName '$TaskName'"
 Write-Host "Then check that it answers on the port set as listenPort in config.yaml"
 Write-Host "(8080 unless changed):   curl http://127.0.0.1:8080/status"
-Write-Host "If it does not come up, read server.log in the project folder."
+Write-Host "If it does not come up, look in the logs folder of the project."
 Write-Host ""
 Write-Host "This only starts the server once someone is logged on. For an" -ForegroundColor Yellow
 Write-Host "unattended machine, set up automatic log on as well -- see README.md." -ForegroundColor Yellow

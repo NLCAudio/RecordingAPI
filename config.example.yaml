@@ -23,7 +23,7 @@ bitrate: 128k
 # are created on demand. Until it ends, a recording is kept in
 # <outputPath>/.in-progress, so everything else there is a finished file.
 outputPath: ./recordings
-logPath: ./recording_api.log
+logPath: ./logs/recording_api.log
 
 # Where the server listens. 127.0.0.1 only accepts requests from this machine;
 # 0.0.0.0 accepts them from other machines too, as needed when Companion runs
@@ -39,6 +39,11 @@ listenPort: 8080
 # accepted. A change needs a restart of the server.
 # acceptRequestsFrom:
 #   - 192.168.1.50
+
+# For setting up: accept requests from every address, whatever the list above
+# says. The log names each address the list would have refused, and warns every
+# ten minutes for as long as this is on. A change needs a restart of the server.
+# debugMode: true
 
 # Set when two servers report to the same Companion ("mac" on one, "windows" on
 # the other, say). The status then goes to the custom variable
