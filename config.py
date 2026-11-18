@@ -29,8 +29,8 @@ class Config(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     # How the audio device is read: "auto" picks audioqueue on macOS and dshow
-    # on Windows. "avfoundation" is ffmpeg's own macOS capture, kept only for
-    # comparison because it loses audio. See backends/__init__.py.
+    # on Windows. "avfoundation" is ffmpeg's own macOS capture, which loses
+    # audio. See backends/__init__.py.
     framework: str = "auto"
     # The audio device to record from. On Windows part of the name is enough,
     # so one setting covers every "DVS Receive N-M (Dante Virtual Soundcard)".
@@ -43,7 +43,8 @@ class Config(BaseModel):
     # seconds, so a value chosen for Windows is safe in a config copied to the Mac.
     audio_buffer_ms: int | None = Field(None, alias="audioBufferMs")
     # Where recordings are written, under a folder per room and, inside it, per
-    # service. Created on demand.
+    # service. Created on demand. A recording in progress is kept in a hidden
+    # folder inside it until it ends; see WORK_FOLDER in recording.py.
     output_path: Path = Field(alias="outputPath")
     log_path: Path = Field(DEFAULT_LOG_PATH, alias="logPath")
     # Every Companion instance the status is pushed to; a site can have more
@@ -52,8 +53,7 @@ class Config(BaseModel):
     # Where run_server.py listens. 127.0.0.1 only accepts requests from this
     # machine, which is enough while Companion runs alongside. "0.0.0.0" accepts
     # them from other machines too, which on Windows also needs an inbound
-    # firewall rule for the port. The port is 8080 because Companion's own
-    # default is 8000. Read once at start-up.
+    # firewall rule for the port. Read once at start-up.
     listen_host: str = Field("127.0.0.1", alias="listenHost")
     listen_port: int = Field(8080, alias="listenPort", ge=1, le=65535)
     # The other machines that may use the API, as addresses (192.168.1.50) or
@@ -113,7 +113,7 @@ class Config(BaseModel):
         if entries is None:
             return []  # the key written with nothing under it
         if isinstance(entries, str):
-            raise ValueError(
+            raise TypeError(
                 "expected a list of addresses, not a single one. Write it as:\n"
                 f"acceptRequestsFrom:\n  - {entries}"
             )
@@ -139,7 +139,7 @@ class Config(BaseModel):
         # A bare address is a common thing to write, and pydantic would only
         # answer "input should be a valid list".
         if isinstance(urls, str):
-            raise ValueError(
+            raise TypeError(
                 "expected a list of addresses, not a single one. Write it as:\n"
                 f"companionBaseUrls:\n  - {urls}"
             )

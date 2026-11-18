@@ -4,13 +4,15 @@ Recording sessions
 
 Everything about recordings that are running: the ffmpeg processes, the
 capture feeding them where ffmpeg does not read the device itself, their live
-audio levels, and the bookkeeping that keeps these in step.
+audio levels, the bookkeeping that keeps these in step, and moving each file
+to its place when the recording ends.
 
 The state lives in SessionRegistry, which also holds the locks protecting it.
 Callers only call registry methods and get a Session back, so the state cannot
 be read without the right lock held.
 """
 
+import ctypes
 import dataclasses
 import logging
 import math
@@ -21,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Collection
 from datetime import datetime
 from pathlib import Path
 
@@ -34,9 +37,30 @@ from config import Config
 # -flush_packets (see build_recording_cmd) gets each MP3 frame to the OS at
 # once, but the OS may hold it in memory until its own writeback — 30 s on
 # macOS — and a power cut takes what is still there. fsync closes that window.
-# Each call measured well under a millisecond, also on a OneDrive folder,
-# because the data is already in the cache.
 DISK_SYNC_INTERVAL_S = 5.0
+
+# Recordings are written into this folder inside outputPath and moved to their
+# place when they end, so everything else in outputPath is a finished file that
+# another job can copy away. It is inside outputPath so that the move is a
+# rename on one volume: instant, and never half done.
+WORK_FOLDER = ".in-progress"
+
+# The server checks that folder this often for files that belong to none of its
+# sessions: left by an earlier run, or by a move that was refused.
+LEFTOVER_CHECK_INTERVAL_S = 60.0
+
+# Such a file is only touched once it has not been written to for this long.
+# A recording writes many times a second, so this spares the ones the sessions
+# cannot name: a recording that is just starting, or one made by an ffmpeg
+# that outlived its server.
+LEFTOVER_IDLE_S = 10.0
+
+# Windows will not move a file that anything holds open: our own disk syncer,
+# or a virus scanner for a moment after ffmpeg has closed it. So finishing a
+# recording waits this long for the syncer, and retries a refused move.
+FILE_RELEASE_TIMEOUT_S = 10.0
+MOVE_ATTEMPTS = 5
+MOVE_RETRY_S = 0.3
 
 # Audio levels below this dB value are treated as silence / no signal.
 FLOOR_LEVEL_DB = -60.0
@@ -61,10 +85,10 @@ STOP_TIMEOUT_S = 10
 
 # Lines ffmpeg prints only once every input and output is open and encoding has
 # begun — not if it gives up on the device, the encoder options or the output
-# file (verified against ffmpeg 8.1). That makes them proof that a recording
-# really started. A level line proves the same and more, so relay_ffmpeg_output
-# counts it too. Two spellings, so that one wording change in a future ffmpeg
-# does not leave every start unconfirmed.
+# file. That makes them proof that a recording really started. A level line
+# proves the same and more, so relay_ffmpeg_output counts it too. Two spellings,
+# so that one wording change in a future ffmpeg does not leave every start
+# unconfirmed.
 #
 # With a feeder, ffmpeg's input is a pipe and these lines say nothing about the
 # device; the feeder opens the device itself and raises if it cannot.
@@ -106,6 +130,12 @@ class RecordingRequest(BaseModel):
     right_input_channel: int = 2  # which input channel maps to the right side
 
 
+def set_event() -> threading.Event:
+    event = threading.Event()
+    event.set()
+    return event
+
+
 @dataclasses.dataclass
 class Session:
     """One recording that is currently running."""
@@ -113,7 +143,8 @@ class Session:
     service_name: str
     process: subprocess.Popen  # the running ffmpeg process
     started_at: float  # Unix timestamp so we can compute elapsed time
-    path: str  # where the MP3 file is being written
+    path: str  # where the MP3 will be once the recording has ended
+    working_path: str  # where it is written until then, in the work folder
     # Live level per output channel: 0 = left, 1 = right. A list, so the stderr
     # reader can write to it by channel number.
     levels: list[float] = dataclasses.field(
@@ -131,6 +162,12 @@ class Session:
     ffmpeg_finished: threading.Event = dataclasses.field(
         default_factory=threading.Event
     )
+    # Clear while sync_to_disk() holds the file open; the move waits for it.
+    file_released: threading.Event = dataclasses.field(default_factory=set_event)
+    # Moving the file into place happens once, whichever of the stop request
+    # and the stderr reader gets there first.
+    finish_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    finished: bool = False
     # Writes the audio into ffmpeg's stdin where ffmpeg does not read the device
     # itself (macOS); None where it does.
     feeder: AudioFeeder | None = None
@@ -219,6 +256,7 @@ class SessionRegistry:
 
             # Only now: it opens the recording by name, and ffmpeg has just
             # confirmed that it created it.
+            session.file_released.clear()
             threading.Thread(
                 target=sync_to_disk,
                 args=(room_name, session),
@@ -240,6 +278,7 @@ class SessionRegistry:
                 return None
 
             stop_ffmpeg(session)
+            finish_recording(room_name, session)
 
             with self._state_lock:
                 self._sessions.pop(room_name, None)
@@ -275,6 +314,11 @@ class SessionRegistry:
                 # One room failing to stop must not leave the others running.
                 logger.exception("[%s] could not be stopped", room_name)
         return stopped
+
+    def working_paths(self) -> set[Path]:
+        """The files in the work folder that are being recorded into right now."""
+        with self._state_lock:
+            return {Path(session.working_path) for session in self._sessions.values()}
 
     def set_level(self, room_name: str, session: Session, channel: int, db: float):
         with self._state_lock:
@@ -322,16 +366,15 @@ def build_recording_cmd(
         # Write each MP3 frame as it is encoded instead of filling ffmpeg's
         # 256KB output buffer first. Without it a power cut loses what is in
         # that buffer: up to sixteen seconds at 128k, and the whole file if the
-        # recording is shorter than that. Measured: ten seconds then SIGKILL
-        # leaves an empty file without the flag and a complete one with it.
-        # The cost is about 38 small writes a second.
+        # recording is shorter than that. The cost is about 38 small writes a
+        # second.
         "-flush_packets",
         "1",
         output_path,
     ]
 
 
-def free_path(path: Path) -> Path:
+def free_path(path: Path, taken: Callable[[Path], bool] = Path.exists) -> Path:
     """The given path, or the first numbered variant of it that is free.
 
     Names are timestamped to the second, so two recordings of one room started
@@ -339,7 +382,7 @@ def free_path(path: Path) -> Path:
     """
     candidate = path
     attempt = 2
-    while candidate.exists():
+    while taken(candidate):
         candidate = path.with_stem(f"{path.stem}_{attempt}")
         attempt += 1
     return candidate
@@ -365,11 +408,23 @@ def safe_name(raw: str, fallback: str) -> str:
     return name
 
 
+def working_path_for(output_path: Path, final: Path) -> Path:
+    """Where what will end up at `final` is kept while it is being recorded."""
+    return output_path / WORK_FOLDER / final.relative_to(output_path)
+
+
+def hide_on_windows(folder: Path) -> None:
+    """Mark a folder hidden. Elsewhere its leading dot already does that."""
+    if sys.platform == "win32":
+        ctypes.windll.kernel32.SetFileAttributesW(str(folder), 0x02)
+
+
 def prepare_output_path(config: Config, request: RecordingRequest) -> str:
-    """Create <outputPath>/<room>/<service>/ and return the file to record into.
+    """Create <outputPath>/<room>/<service>/ and return the finished file's path.
 
     The room, service and timestamp are in the filename too, so a file copied
-    out of its folder still says what it is.
+    out of its folder still says what it is. The same folders are created in
+    the work folder, where the file is written until the recording ends.
     """
     room = safe_name(request.room_name, fallback="room")
     service = safe_name(request.service_name, fallback="service")
@@ -387,22 +442,25 @@ def prepare_output_path(config: Config, request: RecordingRequest) -> str:
             )
 
     directory = config.output_path / room / service
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        # Re-raised with the path: "Permission denied" alone does not say where.
-        raise OSError(f"could not create recording folder {directory}: {e}") from e
+    for folder in (directory, working_path_for(config.output_path, directory)):
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # Re-raised with the path: "Permission denied" alone does not say where.
+            raise OSError(f"could not create recording folder {folder}: {e}") from e
+    hide_on_windows(config.output_path / WORK_FOLDER)
 
     # mkdir succeeding on an existing folder says nothing about writing into
     # it; this catches a read-only OneDrive folder before ffmpeg fails on it.
     if not os.access(directory, os.W_OK):
         raise OSError(f"recording folder {directory} is not writable")
 
-    return str(
-        free_path(
-            directory / f"{room}_{service}_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp3"
-        )
-    )
+    def taken(path: Path) -> bool:
+        # A name is also taken while a recording under it is still in progress.
+        return path.exists() or working_path_for(config.output_path, path).exists()
+
+    name = f"{room}_{service}_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp3"
+    return str(free_path(directory / name, taken))
 
 
 def confirm_started(room_name: str, session: Session) -> None:
@@ -444,11 +502,12 @@ def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
     )
 
     out_path = prepare_output_path(config, request)
+    working_path = str(working_path_for(config.output_path, Path(out_path)))
 
     # stdin is for sending "q" to stop ffmpeg or, with a feeder, for the audio
     # itself; stderr is read by relay_ffmpeg_output for the levels.
     process = subprocess.Popen(
-        build_recording_cmd(config, capture_input, out_path),
+        build_recording_cmd(config, capture_input, working_path),
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -464,7 +523,7 @@ def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
             process.kill()
             process.wait()
             close_pipes(process)
-            Path(out_path).unlink(missing_ok=True)
+            Path(working_path).unlink(missing_ok=True)
             raise
 
     return Session(
@@ -472,6 +531,7 @@ def start_ffmpeg(request: RecordingRequest, config: Config) -> Session:
         process=process,
         started_at=time.time(),
         path=out_path,
+        working_path=working_path,
         feeder=capture_input.feeder,
     )
 
@@ -532,7 +592,7 @@ def sync_to_disk(room_name: str, session: Session) -> None:
     either way, and a read-only handle cannot disturb what ffmpeg is writing.
     """
     try:
-        fd = os.open(session.path, os.O_RDONLY)
+        fd = os.open(session.working_path, os.O_RDONLY)
     except OSError as e:
         # Not worth failing the recording over: -flush_packets gets the data to
         # the OS anyway; only the last seconds before a power cut are at stake.
@@ -540,9 +600,10 @@ def sync_to_disk(room_name: str, session: Session) -> None:
             "[%s] cannot open %s to flush it to disk; recording continues "
             "unsynced: %s",
             room_name,
-            session.path,
+            session.working_path,
             e,
         )
+        session.file_released.set()
         return
 
     try:
@@ -556,7 +617,7 @@ def sync_to_disk(room_name: str, session: Session) -> None:
                 logger.warning(
                     "[%s] cannot flush %s to disk; recording continues unsynced: %s",
                     room_name,
-                    session.path,
+                    session.working_path,
                     e,
                 )
                 return
@@ -566,6 +627,178 @@ def sync_to_disk(room_name: str, session: Session) -> None:
                 return
     finally:
         os.close(fd)
+        session.file_released.set()
+
+
+def move_into_place(working: Path, final: Path) -> Path:
+    """Move a finished file out of the work folder; returns where it now is.
+
+    Never onto an existing file: if the name is taken, a numbered one is used.
+    """
+    destination = free_path(final)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(MOVE_ATTEMPTS - 1):
+        try:
+            os.replace(working, destination)
+            return destination
+        except PermissionError:
+            time.sleep(MOVE_RETRY_S)  # still held open; see MOVE_ATTEMPTS
+    os.replace(working, destination)
+    return destination
+
+
+def finish_recording(room_name: str, session: Session) -> None:
+    """Move a recording that has ended from the work folder to its place.
+
+    Called once ffmpeg has exited, however it ended. Afterwards session.path
+    is where the file actually is.
+    """
+    with session.finish_lock:
+        if session.finished:
+            return
+        session.finished = True
+
+        # Wake the disk syncer for its last pass and wait until it lets go.
+        session.ffmpeg_finished.set()
+        session.file_released.wait(FILE_RELEASE_TIMEOUT_S)
+
+        working = Path(session.working_path)
+        try:
+            if not working.exists():
+                return  # ffmpeg never got as far as creating it
+            if working.stat().st_size == 0:
+                # Nothing was recorded, and in its place it would look as if
+                # something had been.
+                working.unlink()
+                return
+            session.path = str(move_into_place(working, Path(session.path)))
+        except OSError as e:
+            # It stays put until the next check for leftovers.
+            session.path = session.working_path
+            logger.error(
+                "[%s] could not move the finished recording out of %s: %s",
+                room_name,
+                working,
+                e,
+            )
+
+
+@dataclasses.dataclass
+class Leftovers:
+    """What a pass over the work folder did."""
+
+    moved: list[Path] = dataclasses.field(default_factory=list)  # to here
+    removed: list[Path] = dataclasses.field(default_factory=list)  # empty files
+    kept: list[tuple[Path, str]] = dataclasses.field(default_factory=list)  # and why
+
+
+def finish_leftovers(
+    output_path: Path, recording_now: Collection[Path] = ()
+) -> Leftovers:
+    """Move recordings left in the work folder to where they belong.
+
+    A file is left there when the server or the machine went down
+    mid-recording; it is a complete MP3 as far as it got. The files in
+    recording_now, which the sessions are recording into, are not touched,
+    nor is one written to in the last LEFTOVER_IDLE_S seconds.
+    """
+    work = output_path / WORK_FOLDER
+    result = Leftovers()
+    if not work.is_dir():
+        return result
+
+    # Resolved, so that one folder written two ways is still the same folder.
+    recording_now = {path.resolve() for path in recording_now}
+    for working in sorted(path for path in work.rglob("*.mp3") if path.is_file()):
+        if working.resolve() in recording_now:
+            continue
+        final = output_path / working.relative_to(work)
+        try:
+            info = working.stat()
+            if time.time() - info.st_mtime < LEFTOVER_IDLE_S:
+                result.kept.append((working, "still being written"))
+            elif info.st_size == 0:
+                working.unlink()
+                result.removed.append(working)
+            else:
+                result.moved.append(move_into_place(working, final))
+        except FileNotFoundError:
+            continue  # the server finished and moved it meanwhile
+        except OSError as e:
+            result.kept.append((working, str(e)))
+    return result
+
+
+def prune_work_folder(output_path: Path) -> None:
+    """Remove the empty room and service folders left in the work folder.
+
+    Only safe when nothing can be starting: a start creates its folder a
+    moment before ffmpeg puts a file into it.
+    """
+    work = output_path / WORK_FOLDER
+    if not work.is_dir():
+        return
+    folders = (path for path in work.rglob("*") if path.is_dir())
+    for folder in sorted(folders, reverse=True):  # deepest first
+        try:
+            folder.rmdir()
+        except OSError:
+            pass  # not empty
+
+
+def recover_leftovers(
+    output_path: Path,
+    recording_now: Collection[Path] = (),
+    at_start_up: bool = False,
+    already_logged: Collection[tuple[Path, str]] = (),
+) -> list[tuple[Path, str]]:
+    """Finish what is left in the work folder, and log it.
+
+    Returns what had to stay where it is, and why. Passed back in as
+    already_logged, it keeps a file that has to stay from being logged at
+    every check. Only at start-up, before any recording can begin, are the
+    emptied folders cleared out too.
+    """
+    try:
+        leftovers = finish_leftovers(output_path, recording_now)
+        if at_start_up:
+            prune_work_folder(output_path)
+    except OSError as e:
+        problem = (output_path / WORK_FOLDER, f"could not be checked: {e}")
+        if problem not in already_logged:
+            logger.error("%s %s", *problem)
+        return [problem]
+
+    for path in leftovers.moved:
+        logger.warning("moved a leftover recording into place -> %s", path)
+    for path in leftovers.removed:
+        logger.info("removed an empty leftover file: %s", path)
+    for left in leftovers.kept:
+        if left not in already_logged:
+            logger.warning("left %s where it is: %s", *left)
+    return leftovers.kept
+
+
+def watch_for_leftovers(
+    registry: SessionRegistry,
+    output_path: Path,
+    stopped: threading.Event,
+    already_logged: Collection[tuple[Path, str]] = (),
+) -> None:
+    """Check the work folder for leftovers every so often, until `stopped`.
+
+    One thread, for as long as the server runs. What the registry's sessions
+    are recording into is left alone, however quiet the file.
+    """
+    while not stopped.wait(LEFTOVER_CHECK_INTERVAL_S):
+        try:
+            already_logged = recover_leftovers(
+                output_path, registry.working_paths(), already_logged=already_logged
+            )
+        except Exception:
+            # Nothing else reports this: under pythonw.exe a thread's traceback
+            # goes to a stderr that is thrown away.
+            logger.exception("the check for leftover recordings failed")
 
 
 def parse_db(raw_db: bytes) -> float:
@@ -642,3 +875,6 @@ def relay_ffmpeg_output(
             except Exception:
                 logger.exception("[%s] could not release the audio device", room_name)
             process.stderr.close()
+        # Last, because it may wait: for a recording that ended by itself this
+        # is what moves the file; after a stop request it has been done.
+        finish_recording(room_name, session)

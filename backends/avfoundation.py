@@ -37,9 +37,9 @@ class AVFoundationBackend(CaptureBackend):
         # Per recording, not once at start-up, so a config.yaml left on this
         # setting by accident shows up next to every recording it damaged.
         logger.warning(
-            "recording through ffmpeg's avfoundation capture, which drops audio "
-            "(about a tenth of it when measured). Set 'framework: auto' in "
-            "config.yaml to use the audioqueue capture instead."
+            "recording through ffmpeg's avfoundation capture, which drops audio. "
+            "Set 'framework: auto' in config.yaml to use the audioqueue capture "
+            "instead."
         )
         device_index = self.find_device_index()
         return CaptureInput(

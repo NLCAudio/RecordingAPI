@@ -1,10 +1,12 @@
 #!/bin/bash
 #
-# Restart the recording API on this Mac, for after a change to the code.
+# Restart the recording API on this Mac, for after a change to the code or to
+# config.yaml.
 #
-# Stops anything that is recording, restarts the launchd agent, and waits
-# until the server answers. Recordings are stopped through the API rather than
-# by killing ffmpeg, so each MP3 is finalised with an accurate duration header.
+# Stops every recording API server running on this Mac, not only the launchd
+# agent's (stop_servers.py; it ends recordings through the API first, so each
+# MP3 is finalised with an accurate duration header), then starts the agent
+# and waits until the server answers.
 #
 # Usage:
 #   macos/restart.sh            asks first if a room is recording
@@ -15,28 +17,9 @@ set -uo pipefail
 LABEL="${RECORDING_API_LABEL:-local.recording-api}"
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SERVICE="gui/$(id -u)/$LABEL"
-
-# Where to reach the server: listenHost and listenPort from config.yaml, worked
-# out by the server's own code. RECORDING_API_URL overrides it; the fallback is
-# the default address.
-BASE_URL="${RECORDING_API_URL:-}"
-if [ -z "$BASE_URL" ]; then
-    if ! BASE_URL="$(cd "$PROJECT_DIR" && "$PROJECT_DIR/.venv/bin/python" -c \
-        'from config import load_config; print(load_config().local_url)' 2>/dev/null)" ||
-        [ -z "$BASE_URL" ]; then
-        BASE_URL="http://127.0.0.1:8080"
-        echo "warning: could not read the address from config.yaml; trying $BASE_URL" >&2
-    fi
-fi
-
-# The running server may be elsewhere: if listenHost or listenPort was edited
-# after it started, it is still at the address it noted then. Ask it there,
-# and wait for the new one at the address from config.yaml.
-RUNNING_URL="$BASE_URL"
-if [ -z "${RECORDING_API_URL:-}" ] && [ -s "$PROJECT_DIR/server.url" ]; then
-    RUNNING_URL="$(head -n 1 "$PROJECT_DIR/server.url" | tr -d '[:space:]')"
-fi
+PYTHON="$PROJECT_DIR/.venv/bin/python"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
 
 FORCE=""
 case "${1:-}" in
@@ -48,70 +31,45 @@ case "${1:-}" in
         ;;
 esac
 
-# Only used to read and write JSON, so any Python 3 will do.
-PYTHON="$PROJECT_DIR/.venv/bin/python"
-[ -x "$PYTHON" ] || PYTHON="/usr/bin/python3"
-
-if ! launchctl print "$SERVICE" >/dev/null 2>&1; then
-    echo "error: no launchd agent '$LABEL' is loaded." >&2
+if [ ! -x "$PYTHON" ]; then
+    echo "error: no virtual environment at $PROJECT_DIR/.venv" >&2
+    exit 1
+fi
+if [ ! -f "$PLIST" ]; then
+    echo "error: no launchd agent '$LABEL' is installed." >&2
     echo "Run macos/install-agent.sh first." >&2
     exit 1
 fi
 
-# --- 1. Ask the running server what it is doing ------------------------------
-
-# No answer is not an error: restarting a server that is down just starts it.
-rooms=()
-if status_json="$(curl -fsS --max-time 5 "$RUNNING_URL/status" 2>/dev/null)"; then
-    # One room per line, because room names contain spaces.
-    while IFS= read -r room; do
-        [ -n "$room" ] && rooms+=("$room")
-    done < <(printf '%s' "$status_json" | "$PYTHON" -c '
-import json, sys
-for room in json.load(sys.stdin).get("sessions", {}):
-    print(room)
-')
-else
-    echo "No server answering on $RUNNING_URL (it may already be stopped)."
-fi
-
-# --- 2. Stop recordings properly, before anything is killed ------------------
-
-if [ "${#rooms[@]}" -gt 0 ]; then
-    echo "Recording right now:"
-    printf '  %s\n' "${rooms[@]}"
-    if [ -z "$FORCE" ]; then
-        read -r -p "Stop these recordings and restart? [y/N] " answer
-        case "$answer" in
-            [Yy]*) ;;
-            *)
-                echo "Nothing changed; the server is still running."
-                exit 1
-                ;;
-        esac
+# Where the restarted server will answer: listenHost and listenPort from
+# config.yaml, worked out by the server's own code. RECORDING_API_URL overrides
+# it; the fallback is the default address.
+BASE_URL="${RECORDING_API_URL:-}"
+if [ -z "$BASE_URL" ]; then
+    if ! BASE_URL="$(cd "$PROJECT_DIR" && "$PYTHON" -c \
+        'from config import load_config; print(load_config().local_url)' 2>/dev/null)" ||
+        [ -z "$BASE_URL" ]; then
+        BASE_URL="http://127.0.0.1:8080"
+        echo "warning: could not read the address from config.yaml; trying $BASE_URL" >&2
     fi
-    for room in "${rooms[@]}"; do
-        echo "Stopping recording in $room ..."
-        body="$("$PYTHON" -c 'import json, sys; print(json.dumps({"room_name": sys.argv[1]}))' "$room")"
-        # Worth continuing if this fails: the restart is still wanted, and a
-        # killed recording stays playable.
-        curl -fsS --max-time 30 -X POST -H 'Content-Type: application/json' \
-            -d "$body" "$RUNNING_URL/recording/stop" >/dev/null ||
-            echo "  warning: could not stop $room cleanly" >&2
-    done
 fi
 
-# --- 3. Restart the agent -----------------------------------------------------
+# --- 1. Stop every server on this Mac ----------------------------------------
 
-# -k stops the running server first. launchd also clears out what the server
-# left in its process group, so no ffmpeg survives holding the audio device.
-echo "Restarting launchd agent '$LABEL' ..."
-if ! launchctl kickstart -k "$SERVICE"; then
-    echo "error: launchd could not restart the agent." >&2
+# Asks first if a room is recording, and unloads the agent, which would
+# otherwise start its server straight again.
+RECORDING_API_LABEL="$LABEL" "$PYTHON" "$PROJECT_DIR/stop_servers.py" ${FORCE:+--force} ||
+    exit $?
+
+# --- 2. Start the agent -------------------------------------------------------
+
+echo "Starting launchd agent '$LABEL' ..."
+if ! launchctl bootstrap "$DOMAIN" "$PLIST"; then
+    echo "error: launchd could not load the agent." >&2
     exit 1
 fi
 
-# --- 4. Wait until it actually answers ---------------------------------------
+# --- 3. Wait until it actually answers ---------------------------------------
 
 # A syntax error in the changed code would exit at once and be restarted in a
 # loop, so confirm rather than assume.
