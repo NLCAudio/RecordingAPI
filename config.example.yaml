@@ -20,15 +20,15 @@ bitrate: 128k
 # audioBufferMs: 200
 
 # Recordings are filed as <outputPath>/<room>/<service>/<file>.mp3; the folders
-# are created on demand. Until it ends, a recording is kept in
-# <outputPath>/.in-progress, so everything else there is a finished file.
+# are created on demand.
 outputPath: ./recordings
 logPath: ./recording_api.log
 
 # Where the server listens. 127.0.0.1 only accepts requests from this machine;
 # 0.0.0.0 accepts them from other machines too, as needed when Companion runs
-# elsewhere (on Windows the port also needs an inbound firewall rule). A change
-# needs a restart of the server.
+# elsewhere (on Windows the port also needs an inbound firewall rule). The port
+# is 8080 because Companion's own default is 8000. A change needs a restart of
+# the server.
 listenHost: 127.0.0.1
 listenPort: 8080
 
@@ -46,7 +46,8 @@ listenPort: 8080
 # overwrite each other. Letters, digits and underscores only.
 # serverName: mac
 
-# Every Companion instance the status is pushed to, one per line.
+# Every Companion instance the status is pushed to, one per line. Each has its
+# own push thread, so one being switched off does not slow the others.
 companionBaseUrls:
   - http://127.0.0.1:8000/
 

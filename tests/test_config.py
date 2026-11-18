@@ -36,7 +36,8 @@ class ConfigTest(unittest.TestCase):
 
     def test_an_unknown_setting_is_rejected(self):
         # What makes a typo in an optional key an error instead of a setting
-        # that silently never applies.
+        # that silently never applies. It also means a key this server has
+        # stopped using has to be removed from config.yaml.
         with self.assertRaises(ValidationError) as raised:
             Config(**REQUIRED, apiVersion="0.0.1")
         self.assertIn("apiVersion", str(raised.exception))

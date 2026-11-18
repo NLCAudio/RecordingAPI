@@ -29,7 +29,6 @@ This file holds only the HTTP layer. The work behind it lives in:
 
 import ipaddress
 import logging
-import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from logging.handlers import RotatingFileHandler
@@ -47,12 +46,7 @@ from starlette.responses import JSONResponse
 from backends import ChannelNotAvailableError, DeviceNotFoundError
 from companion import start_status_push, variable_name
 from config import DEFAULT_LOG_PATH, Config, load_config
-from recording import (
-    RecordingRequest,
-    SessionRegistry,
-    recover_leftovers,
-    watch_for_leftovers,
-)
+from recording import RecordingRequest, SessionRegistry
 
 # The application log: recording starts and stops, every request that failed,
 # and everything ffmpeg prints on stderr except the level lines, which would
@@ -107,17 +101,6 @@ async def lifespan(app: FastAPI):
     setup_logging(config.log_path)
     global startup_config
     startup_config = config
-    # Nothing is recording yet, so whatever is in the work folder was left by
-    # an earlier run that was cut short. Move it to where it belongs, and keep
-    # checking while the server runs, for what no session is recording into.
-    left = recover_leftovers(config.output_path, at_start_up=True)
-    shutting_down = threading.Event()
-    threading.Thread(
-        target=watch_for_leftovers,
-        args=(registry, config.output_path, shutting_down, left),
-        daemon=True,
-        name="leftovers",
-    ).start()
     if config.accept_requests_from:
         logger.info(
             "Accepting requests from this machine and from %s",
@@ -141,7 +124,6 @@ async def lifespan(app: FastAPI):
     yield
     # Shutting down (the machine is restarting, or someone is logging out):
     # stop what is recording so each MP3 is finalised rather than cut off.
-    shutting_down.set()
     stopped = registry.stop_all()
     if stopped:
         logger.info("server shutting down; stopped recording in %s", ", ".join(stopped))
@@ -164,7 +146,8 @@ def accepts_other_machines(listen_host: str) -> bool:
 async def refuse_unlisted_addresses(request: Request, call_next):
     """Turn away requests from addresses not listed under acceptRequestsFrom.
 
-    The one place access is decided, for every endpoint.
+    The one place access is decided: for every endpoint, and the same way on
+    macOS and Windows, independent of either machine's firewall.
     """
     client = request.client.host if request.client else None
     server = request.scope.get("server")

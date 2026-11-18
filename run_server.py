@@ -4,7 +4,8 @@ Server launcher
 
 How the recording API is started: by hand with `python run_server.py`, by the
 Windows scheduled task, and by the macOS launchd agent. It listens where
-listenHost and listenPort in config.yaml say.
+listenHost and listenPort in config.yaml say, and notes that address in
+server.url for the restart scripts.
 
 `uvicorn main:app` is fine while developing, but a server started in the
 background has two problems this file solves:
@@ -26,10 +27,16 @@ from pathlib import Path
 
 import uvicorn
 
-from config import Config, load_config
+from config import Config, load_config, local_url
 
 PROJECT_DIR = Path(__file__).parent
 SERVER_LOG = PROJECT_DIR / "server.log"
+
+# The address this run of the server listens on, written at start-up for the
+# restart scripts. config.yaml only says where the next start will listen; once
+# it has been edited, a restart must find the running server where it still is
+# to stop its recordings cleanly.
+SERVER_URL_FILE = PROJECT_DIR / "server.url"
 
 # Same rotation as the recording log in main.py: 5 MB, 3 old files kept.
 LOG_CONFIG = {
@@ -76,6 +83,11 @@ def listen_address() -> tuple[str, int]:
 if __name__ == "__main__":
     os.chdir(PROJECT_DIR)
     host, port = listen_address()
+    try:
+        SERVER_URL_FILE.write_text(local_url(host, port) + "\n")
+    except OSError:
+        # Only the restart scripts read it, and they fall back to config.yaml.
+        pass
     uvicorn.run(
         "main:app",
         host=host,

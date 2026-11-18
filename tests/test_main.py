@@ -1,16 +1,14 @@
 import asyncio
-import os
 import tempfile
 import time
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from starlette.requests import Request
 
 import main
 from backends import ChannelNotAvailableError, DeviceNotFoundError
-from recording import WORK_FOLDER, RecordingRequest
+from recording import RecordingRequest
 from tests.support import make_config
 
 
@@ -102,43 +100,6 @@ class ShutdownTest(unittest.TestCase):
 
         registry.stop_all.assert_called_once_with()
         self.assertIn("stopped recording in Room", logged[-1])
-
-
-class StartUpTest(unittest.TestCase):
-    def test_recordings_an_earlier_run_left_behind_are_moved_into_place(self):
-        with tempfile.TemporaryDirectory() as folder:
-            leftover = Path(folder) / WORK_FOLDER / "Room" / "Test" / "take.mp3"
-            leftover.parent.mkdir(parents=True)
-            leftover.write_bytes(b"audio")
-            an_hour_ago = time.time() - 3600
-            os.utime(leftover, (an_hour_ago, an_hour_ago))
-
-            logged = run_lifespan(self, make_config(folder))
-
-            self.assertTrue((Path(folder) / "Room" / "Test" / "take.mp3").exists())
-            self.assertFalse(leftover.exists())
-        self.assertTrue(any("moved a leftover recording" in line for line in logged))
-
-    def test_the_check_goes_on_for_as_long_as_the_server_runs(self):
-        with tempfile.TemporaryDirectory() as folder:
-            # The server crashed and came straight back: written to moments
-            # ago, the file cannot yet be told from one still being recorded.
-            fresh = Path(folder) / WORK_FOLDER / "Room" / "Test" / "take.mp3"
-            fresh.parent.mkdir(parents=True)
-            fresh.write_bytes(b"audio")
-
-            with mock.patch.object(main.threading, "Thread") as thread:
-                run_lifespan(self, make_config(folder))
-
-            self.assertTrue(fresh.exists())  # not at start-up
-
-        started = thread.call_args.kwargs
-        self.assertIs(started["target"], main.watch_for_leftovers)
-        _, output_path, stopped, already_logged = started["args"]
-        self.assertEqual(output_path, Path(folder))
-        self.assertEqual(already_logged, [(fresh, "still being written")])
-        thread.return_value.start.assert_called_once_with()
-        self.assertTrue(stopped.is_set())  # it ends with the server
 
 
 class AccessTest(unittest.TestCase):

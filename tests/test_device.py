@@ -43,6 +43,8 @@ FRAMEWORK = os.environ.get("RECORDING_API_TEST_FRAMEWORK", "auto")
 
 # How much shorter than its running time a recording may be. Starting ffmpeg
 # and opening the device takes a few tenths of a second, which is not loss.
+# The capture this replaced on macOS lost two seconds in twenty, so one second
+# separates the two cleanly.
 ALLOWED_SHORTFALL_S = 1.0
 
 # Words in a log line that mean audio did not make it into the file: the macOS

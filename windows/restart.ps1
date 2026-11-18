@@ -1,24 +1,24 @@
 <#
 .SYNOPSIS
-    Restart the recording API, for after a change to the code or to config.yaml.
+    Restart the recording API, for after a change to the code.
 
 .DESCRIPTION
-    Stops every recording API server running on this machine, not only the
-    scheduled task's, starts the server again, and waits until it answers.
+    Stops anything that is recording, stops the server, starts it again, and
+    waits until it answers.
 
-    The stopping is done by stop_servers.py. Recordings are stopped through the
-    API, not by killing ffmpeg, so each MP3 is finalised with an accurate
-    duration header. What is still running after that is killed as a process
-    tree: an orphaned ffmpeg holds the Dante device open, and the next
-    recording then fails to start.
+    Recordings are stopped through the API, not by killing ffmpeg, so each MP3
+    is finalised with an accurate duration header. What is still running after
+    that is killed as a process tree: an orphaned ffmpeg holds the Dante device
+    open, and the next recording then fails to start.
 
 .PARAMETER TaskName
     The scheduled task registered by install-task.ps1. If no task by that name
     exists, the server is started directly instead.
 
 .PARAMETER BaseUrl
-    Where the restarted server is expected to answer. Left out, that is
-    listenHost and listenPort from config.yaml.
+    Where to reach the server from this machine. Left out, the running server
+    is looked for at the address it recorded in server.url when it started,
+    and the restarted one at listenHost and listenPort from config.yaml.
 
 .PARAMETER Force
     Restart without asking, even if rooms are recording. For unattended use.
@@ -41,13 +41,14 @@ $ErrorActionPreference = 'Stop'
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $Launcher = Join-Path $ProjectDir 'run_server.py'
 
-# python.exe, not pythonw.exe, which has no output to read.
-$python = Join-Path $ProjectDir '.venv\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $python)) { $python = 'python.exe' }
-
-# Where the restarted server will answer: listenHost and listenPort from
-# config.yaml, worked out by the server's own code, unless -BaseUrl was given.
+# Where to reach the server: listenHost and listenPort from config.yaml, worked
+# out by the server's own code, unless -BaseUrl was given. python.exe, not
+# pythonw.exe, which has no output to read.
+$RunningUrl = $BaseUrl
 if (-not $BaseUrl) {
+    $python = Join-Path $ProjectDir '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $python)) { $python = 'python.exe' }
+
     $answer = $null
     Push-Location $ProjectDir
     try {
@@ -69,19 +70,84 @@ if (-not $BaseUrl) {
         $BaseUrl = 'http://127.0.0.1:8080'
         Write-Warning "Could not read the address from config.yaml; trying $BaseUrl"
     }
+
+    # The running server may be elsewhere: if listenHost or listenPort was
+    # edited after it started, it is still at the address it noted then. Ask it
+    # there, and wait for the new one at the address from config.yaml.
+    $RunningUrl = $BaseUrl
+    $urlFile = Join-Path $ProjectDir 'server.url'
+    if (Test-Path -LiteralPath $urlFile) {
+        $recorded = "$(Get-Content -LiteralPath $urlFile -TotalCount 1)".Trim()
+        if ($recorded -like 'http*') { $RunningUrl = $recorded }
+    }
 }
 
-# --- 1. Stop every server on this machine -------------------------------------
+# --- 1. Ask the running server what it is doing -------------------------------
 
-# stop_servers.py asks first if a room is recording, and ends the scheduled
-# task.
-$env:RECORDING_API_TASK = $TaskName
-$stopArguments = @((Join-Path $ProjectDir 'stop_servers.py'))
-if ($Force) { $stopArguments += '--force' }
-& $python @stopArguments
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# No answer is not an error: restarting a server that is down just starts it.
+$status = $null
+try {
+    $status = Invoke-RestMethod -Uri "$RunningUrl/status" -TimeoutSec 5
+}
+catch {
+    Write-Host "No server answering on $RunningUrl (it may already be stopped)."
+}
 
-# --- 2. Start it again --------------------------------------------------------
+$rooms = @()
+if ($null -ne $status -and $null -ne $status.sessions) {
+    # Filtered to NoteProperty rather than ".Properties.Name": on an idle
+    # server "sessions" is {}, and .Name on the empty collection yields a
+    # single $null, which reads as one room recording, called null.
+    $rooms = @($status.sessions.PSObject.Properties |
+            Where-Object { $_.MemberType -eq 'NoteProperty' } |
+            Select-Object -ExpandProperty Name)
+}
+
+# --- 2. Stop recordings properly, before anything is killed -------------------
+
+if ($rooms.Count -gt 0) {
+    Write-Warning "Recording right now: $($rooms -join ', ')"
+    if (-not $Force) {
+        $answer = Read-Host "Stop these recordings and restart? [y/N]"
+        if ($answer -notmatch '^[Yy]') {
+            Write-Host "Nothing changed; the server is still running." -ForegroundColor Green
+            exit 1
+        }
+    }
+    foreach ($room in $rooms) {
+        Write-Host "Stopping recording in $room ..."
+        $body = @{ room_name = $room } | ConvertTo-Json -Compress
+        try {
+            $result = Invoke-RestMethod -Method Post -Uri "$RunningUrl/recording/stop" `
+                -ContentType 'application/json' -Body $body -TimeoutSec 30
+            Write-Host "  saved $($result.file)"
+        }
+        catch {
+            # Worth continuing: the restart is still wanted, and a killed
+            # recording stays playable.
+            Write-Warning "  could not stop $room cleanly: $($_.Exception.Message)"
+        }
+    }
+}
+
+# --- 3. Stop the server, and any ffmpeg underneath it -------------------------
+
+$procs = @(Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe'" |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like '*run_server.py*' })
+
+foreach ($proc in $procs) {
+    Write-Host "Stopping server process $($proc.ProcessId) ..."
+    # /T takes the whole tree, so no ffmpeg is left behind holding the device.
+    & taskkill.exe /PID $proc.ProcessId /T /F 2>&1 | Out-Null
+}
+if ($procs.Count -eq 0) {
+    Write-Host "No server process was running."
+}
+
+# Give the socket a moment to be released, or the new server fails to bind.
+Start-Sleep -Seconds 2
+
+# --- 4. Start it again --------------------------------------------------------
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -ne $task) {
@@ -104,7 +170,7 @@ else {
     Start-Process -FilePath $pythonw -ArgumentList ('"{0}"' -f $Launcher) -WorkingDirectory $ProjectDir
 }
 
-# --- 3. Wait until it actually answers ----------------------------------------
+# --- 5. Wait until it actually answers ----------------------------------------
 
 # Starting the task only means Windows launched it. A syntax error in the
 # changed code would still exit at once, so confirm rather than assume.

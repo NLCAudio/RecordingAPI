@@ -6,11 +6,12 @@ The default on macOS. The server reads the audio device itself, through Apple's
 Audio Queue Services, and pipes the audio to ffmpeg, which only encodes it.
 
 ffmpeg is not left to read the device, as on Windows, because its macOS capture
-(avfoundation) loses audio: it keeps only the latest chunk macOS hands it, so
-one is overwritten whenever it looks slightly late, and it has no option to
-change that. An audio queue holds seconds of audio, so a late reader costs
-nothing until the queue is full; if audio is lost anyway, the queue's
-timestamps show it and it is logged.
+(avfoundation) loses audio: macOS hands it a 512-sample chunk every 10.7 ms,
+ffmpeg keeps only the latest and looks about every 10 ms, so a chunk is
+overwritten whenever it looks slightly late. That measured a tenth of the audio
+on a MacBook's microphone, and ffmpeg has no option to change it. An audio
+queue holds seconds of audio, so a late reader costs nothing until the queue is
+full; if audio is lost anyway, the queue's timestamps show it and it is logged.
 
 The Dante Virtual Soundcard is one device carrying all of its channels, so a
 channel number is a channel of that device. The room's two channels are picked

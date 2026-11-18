@@ -14,9 +14,11 @@ venv/
 # This machine's settings. Copy config.example.yaml to config.yaml to start.
 config.yaml
 
-# Written while the server runs: the logs and their rotated copies.
+# Written while the server runs: the logs, their rotated copies, and the
+# address the running server is listening on.
 *.log
 *.log.*
+server.url
 
 # Recordings
 recordings/
